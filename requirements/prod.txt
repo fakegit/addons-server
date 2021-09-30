@@ -421,9 +421,9 @@ pygit2==1.4.0 \
 webencodings==0.5.1 \
     --hash=sha256:a0af1213f3c2226497a97e2b3aa01a7e4bee4f403f95be16fc9acd2947514a78 \
     --hash=sha256:b36a1c245f2d304965eb4e0a82848379241dc04b865afcc4aab16748587e1923
-cachetools==4.2.2 \
-    --hash=sha256:2cc0b89715337ab6dbba85b5b50effe2b0c74e035d83ee8ed637cf52f12ae001 \
-    --hash=sha256:61b5ed1e22a0924aed1d23b478f37e8d52549ff8a961de2909c69bf950020cff
+cachetools==4.2.3 \
+    --hash=sha256:6a6fa6802188ab7e77bab2db001d676e854499552b0037d999d5b9f211db5250 \
+    --hash=sha256:0a3d3556c2c3befdbba2f93b78792c199c66201c999e97947ea0b7437758246b
 # sqlparse is required by django2.2+
 sqlparse==0.4.2 \
     --hash=sha256:48719e356bb8b42991bdbb1e8b83223757b93789c00910a616a071910ca4a64d \
