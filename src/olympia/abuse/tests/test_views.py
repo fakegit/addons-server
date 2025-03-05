@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from unittest import mock
 
 from django.conf import settings
+from django.core import mail
 from django.test.utils import override_settings
 from django.urls import reverse
 from django.utils.encoding import force_bytes
@@ -27,10 +28,17 @@ from olympia.amo.tests import (
     reverse_ns,
     user_factory,
 )
+from olympia.constants.abuse import DECISION_ACTIONS
 from olympia.core import get_user, set_user
 from olympia.ratings.models import Rating
 
-from ..models import AbuseReport, CinderJob
+from ..actions import (
+    ContentActionApproveNoAction,
+    ContentActionDisableAddon,
+    ContentActionTargetAppealApprove,
+    ContentActionTargetAppealRemovalAffirmation,
+)
+from ..models import AbuseReport, CinderAppeal, CinderJob, ContentDecision
 from ..views import CinderInboundPermission, cinder_webhook, filter_enforcement_actions
 
 
@@ -531,33 +539,214 @@ class AddonAbuseViewSetTestBase:
         assert response.status_code == 400
         assert json.loads(response.content) == {'addon_install_method': 'Invalid value'}
 
-    def _setup_reportable_reason(self, reason):
-        addon = addon_factory(guid='@badman')
+    def _setup_reportable_reason(self, reason, *, addon=None, extra_data=None):
+        addon = addon or addon_factory(guid='@badman')
         response = self.client.post(
             self.url,
-            data={'addon': addon.guid, 'reason': reason},
+            data={'addon': addon.guid, 'reason': reason, **(extra_data or {})},
             REMOTE_ADDR='123.45.67.89',
             HTTP_X_FORWARDED_FOR=f'123.45.67.89, {get_random_ip()}',
         )
         assert response.status_code == 201, response.content
 
     @mock.patch('olympia.abuse.tasks.report_to_cinder.delay')
-    @override_switch('enable-cinder-reporting', active=True)
+    @override_switch('dsa-job-technical-processing', active=True)
     def test_reportable_reason_calls_cinder_task(self, task_mock):
         self._setup_reportable_reason('hateful_violent_deceptive')
         task_mock.assert_called()
 
     @mock.patch('olympia.abuse.tasks.report_to_cinder.delay')
-    @override_switch('enable-cinder-reporting', active=False)
+    @override_switch('dsa-job-technical-processing', active=True)
+    def test_reportable_reason_does_call_if_version_listed(self, task_mock):
+        addon = addon_factory(guid='@badman')
+        self._setup_reportable_reason(
+            'hateful_violent_deceptive',
+            addon=addon,
+            extra_data={'addon_version': addon.current_version.version},
+        )
+        task_mock.assert_called()
+
+    @mock.patch('olympia.abuse.tasks.report_to_cinder.delay')
+    @override_switch('dsa-job-technical-processing', active=True)
+    def test_reportable_reason_does_not_call_if_version_unlisted(self, task_mock):
+        addon = addon_factory(guid='@badman')
+        version = addon.current_version
+        self.make_addon_unlisted(addon)
+        self._setup_reportable_reason(
+            'hateful_violent_deceptive',
+            addon=addon,
+            extra_data={'addon_version': version.version},
+        )
+        task_mock.assert_not_called()
+
+    @mock.patch('olympia.abuse.tasks.report_to_cinder.delay')
+    @override_switch('dsa-job-technical-processing', active=False)
     def test_reportable_reason_does_not_call_cinder_with_waffle_off(self, task_mock):
         self._setup_reportable_reason('hateful_violent_deceptive')
         task_mock.assert_not_called()
 
     @mock.patch('olympia.abuse.tasks.report_to_cinder.delay')
-    @override_switch('enable-cinder-reporting', active=True)
+    @override_switch('dsa-job-technical-processing', active=True)
     def test_not_reportable_reason_does_not_call_cinder_task(self, task_mock):
         self._setup_reportable_reason('feedback_spam')
         task_mock.assert_not_called()
+
+    def test_reject_illegal_category_when_reason_is_not_illegal(self):
+        addon = addon_factory(guid='@badman')
+        response = self.client.post(
+            self.url,
+            data={
+                'addon': addon.guid,
+                'reason': 'feedback_spam',
+                'illegal_category': 'other',
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_category': [
+                'This value must be omitted or set to "null" when the `reason` is '
+                'not "illegal".'
+            ],
+        }
+
+    def test_reject_illegal_subcategory_when_reason_is_not_illegal(self):
+        addon = addon_factory(guid='@badman')
+        response = self.client.post(
+            self.url,
+            data={
+                'addon': addon.guid,
+                'reason': 'feedback_spam',
+                'illegal_subcategory': 'other',
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_subcategory': [
+                'This value must be omitted or set to "null" when the `reason` is '
+                'not "illegal".'
+            ],
+        }
+
+    def test_illegal_category_required_when_reason_is_illegal(self):
+        addon = addon_factory(guid='@badman')
+        response = self.client.post(
+            self.url, data={'addon': addon.guid, 'reason': 'illegal'}
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_category': ['This field is required.']
+        }
+
+    def test_illegal_category_cannot_be_blank_when_reason_is_illegal(self):
+        addon = addon_factory(guid='@badman')
+        response = self.client.post(
+            self.url,
+            data={
+                'addon': addon.guid,
+                'reason': 'illegal',
+                'illegal_category': '',
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_category': ['"" is not a valid choice.']
+        }
+
+    def test_illegal_category_cannot_be_null_when_reason_is_illegal(self):
+        addon = addon_factory(guid='@badman')
+        response = self.client.post(
+            self.url,
+            data={
+                'addon': addon.guid,
+                'reason': 'illegal',
+                'illegal_category': None,
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_category': ['This field may not be null.']
+        }
+
+    def test_illegal_subcategory_required_when_reason_is_illegal(self):
+        addon = addon_factory(guid='@badman')
+        response = self.client.post(
+            self.url,
+            data={
+                'addon': addon.guid,
+                'reason': 'illegal',
+                'illegal_category': 'animal_welfare',
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_subcategory': ['This field is required.']
+        }
+
+    def test_illegal_subcategory_cannot_be_blank_when_reason_is_illegal(self):
+        addon = addon_factory(guid='@badman')
+        response = self.client.post(
+            self.url,
+            data={
+                'addon': addon.guid,
+                'reason': 'illegal',
+                'illegal_category': 'animal_welfare',
+                'illegal_subcategory': '',
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_subcategory': ['"" is not a valid choice.']
+        }
+
+    def test_illegal_subcategory_cannot_be_null_when_reason_is_illegal(self):
+        addon = addon_factory(guid='@badman')
+        response = self.client.post(
+            self.url,
+            data={
+                'addon': addon.guid,
+                'reason': 'illegal',
+                'illegal_category': 'animal_welfare',
+                'illegal_subcategory': None,
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_subcategory': ['This field may not be null.']
+        }
+
+    def test_illegal_subcategory_depends_on_category(self):
+        addon = addon_factory(guid='@badman')
+        response = self.client.post(
+            self.url,
+            data={
+                'addon': addon.guid,
+                'reason': 'illegal',
+                'illegal_category': 'animal_welfare',
+                'illegal_subcategory': 'biometric_data_breach',
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_subcategory': [
+                'This value cannot be used in combination with the supplied '
+                '`illegal_category`.'
+            ]
+        }
+
+    def test_addon_signature_unknown(self):
+        addon = addon_factory()
+        response = self.client.post(
+            self.url,
+            data={
+                'addon': str(addon.id),
+                'message': 'abuse!',
+                'addon_signature': 'unknown: undefined',
+            },
+        )
+        assert response.status_code == 201
+
+        report = AbuseReport.objects.get(guid=addon.guid)
+        assert report.addon_signature == AbuseReport.ADDON_SIGNATURES.UNKNOWN
 
 
 class TestAddonAbuseViewSetLoggedOut(AddonAbuseViewSetTestBase, TestCase):
@@ -675,7 +864,13 @@ class UserAbuseViewSetTestBase:
     def test_message_not_required_with_content_reason(self):
         user = user_factory()
         response = self.client.post(
-            self.url, data={'user': str(user.username), 'reason': 'illegal'}
+            self.url,
+            data={
+                'user': str(user.username),
+                'reason': 'illegal',
+                'illegal_category': 'animal_welfare',
+                'illegal_subcategory': 'other',
+            },
         )
         assert response.status_code == 201
 
@@ -696,7 +891,13 @@ class UserAbuseViewSetTestBase:
 
         response = self.client.post(
             self.url,
-            data={'user': str(user.username), 'reason': 'illegal', 'message': 'Fine!'},
+            data={
+                'user': str(user.username),
+                'reason': 'illegal',
+                'message': 'Fine!',
+                'illegal_category': 'animal_welfare',
+                'illegal_subcategory': 'other',
+            },
         )
         assert response.status_code == 201
 
@@ -750,19 +951,19 @@ class UserAbuseViewSetTestBase:
         assert response.status_code == 201, response.content
 
     @mock.patch('olympia.abuse.tasks.report_to_cinder.delay')
-    @override_switch('enable-cinder-reporting', active=True)
+    @override_switch('dsa-job-technical-processing', active=True)
     def test_reportable_reason_calls_cinder_task(self, task_mock):
         self._setup_reportable_reason('hateful_violent_deceptive')
         task_mock.assert_called()
 
     @mock.patch('olympia.abuse.tasks.report_to_cinder.delay')
-    @override_switch('enable-cinder-reporting', active=False)
+    @override_switch('dsa-job-technical-processing', active=False)
     def test_reportable_reason_does_not_call_cinder_with_waffle_off(self, task_mock):
         self._setup_reportable_reason('hateful_violent_deceptive')
         task_mock.assert_not_called()
 
     @mock.patch('olympia.abuse.tasks.report_to_cinder.delay')
-    @override_switch('enable-cinder-reporting', active=True)
+    @override_switch('dsa-job-technical-processing', active=True)
     def test_no_reason_does_not_call_cinder_task(self, task_mock):
         self._setup_reportable_reason(None, 'Some message since no reason is provided')
         task_mock.assert_not_called()
@@ -783,6 +984,148 @@ class UserAbuseViewSetTestBase:
         report = AbuseReport.objects.get(user_id=user.id)
         self.check_report(report, f'Abuse Report for User {user.pk}')
         assert report.application_locale == 'Lô-käl'
+
+    def test_reject_illegal_category_when_reason_is_not_illegal(self):
+        user = user_factory()
+        response = self.client.post(
+            self.url,
+            data={
+                'user': str(user.username),
+                'reason': 'feedback_spam',
+                'illegal_category': 'other',
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_category': [
+                'This value must be omitted or set to "null" when the `reason` is '
+                'not "illegal".'
+            ],
+        }
+
+    def test_reject_illegal_subcategory_when_reason_is_not_illegal(self):
+        user = user_factory()
+        response = self.client.post(
+            self.url,
+            data={
+                'user': str(user.username),
+                'reason': 'feedback_spam',
+                'illegal_subcategory': 'other',
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_subcategory': [
+                'This value must be omitted or set to "null" when the `reason` is '
+                'not "illegal".'
+            ],
+        }
+
+    def test_illegal_category_required_when_reason_is_illegal(self):
+        user = user_factory()
+        response = self.client.post(
+            self.url, data={'user': str(user.username), 'reason': 'illegal'}
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_category': ['This field is required.']
+        }
+
+    def test_illegal_category_cannot_be_blank_when_reason_is_illegal(self):
+        user = user_factory()
+        response = self.client.post(
+            self.url,
+            data={
+                'user': str(user.username),
+                'reason': 'illegal',
+                'illegal_category': '',
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_category': ['"" is not a valid choice.']
+        }
+
+    def test_illegal_category_cannot_be_null_when_reason_is_illegal(self):
+        user = user_factory()
+        response = self.client.post(
+            self.url,
+            data={
+                'user': str(user.username),
+                'reason': 'illegal',
+                'illegal_category': None,
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_category': ['This field may not be null.']
+        }
+
+    def test_illegal_subcategory_required_when_reason_is_illegal(self):
+        user = user_factory()
+        response = self.client.post(
+            self.url,
+            data={
+                'user': str(user.username),
+                'reason': 'illegal',
+                'illegal_category': 'animal_welfare',
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_subcategory': ['This field is required.']
+        }
+
+    def test_illegal_subcategory_cannot_be_blank_when_reason_is_illegal(self):
+        user = user_factory()
+        response = self.client.post(
+            self.url,
+            data={
+                'user': str(user.username),
+                'reason': 'illegal',
+                'illegal_category': 'animal_welfare',
+                'illegal_subcategory': '',
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_subcategory': ['"" is not a valid choice.']
+        }
+
+    def test_illegal_subcategory_cannot_be_null_when_reason_is_illegal(self):
+        user = user_factory()
+        response = self.client.post(
+            self.url,
+            data={
+                'user': str(user.username),
+                'reason': 'illegal',
+                'illegal_category': 'animal_welfare',
+                'illegal_subcategory': None,
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_subcategory': ['This field may not be null.']
+        }
+
+    def test_illegal_subcategory_depends_on_category(self):
+        user = user_factory()
+        response = self.client.post(
+            self.url,
+            data={
+                'user': str(user.username),
+                'reason': 'illegal',
+                'illegal_category': 'animal_welfare',
+                'illegal_subcategory': 'biometric_data_breach',
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_subcategory': [
+                'This value cannot be used in combination with the supplied '
+                '`illegal_category`.'
+            ]
+        }
 
 
 class TestUserAbuseViewSetLoggedOut(UserAbuseViewSetTestBase, TestCase):
@@ -830,8 +1173,10 @@ class TestCinderWebhook(TestCase):
     def setUp(self):
         self.task_user = user_factory(pk=settings.TASK_USER_ID)
 
-    def get_data(self, filename='cinder_webhook.json'):
-        webhook_file = os.path.join(TESTS_DIR, 'assets', filename)
+    def get_data(self, filename='decision.json'):
+        webhook_file = os.path.join(
+            TESTS_DIR, 'assets', 'cinder_webhook_payloads', filename
+        )
         with open(webhook_file) as file_object:
             return json.loads(file_object.read())
 
@@ -903,57 +1248,50 @@ class TestCinderWebhook(TestCase):
             'not-amo-action',  # not a valid action at all
         ]
         assert filter_enforcement_actions(actions_from_json, cinder_job) == [
-            CinderJob.DECISION_ACTIONS.AMO_DISABLE_ADDON,
+            DECISION_ACTIONS.AMO_DISABLE_ADDON,
             # no AMO_BAN_USER action because not a user target
-            CinderJob.DECISION_ACTIONS.AMO_APPROVE,
+            DECISION_ACTIONS.AMO_APPROVE,
         ]
 
         # check with another content type too
         abuse_report.update(guid=None, user=user_factory())
         assert filter_enforcement_actions(actions_from_json, cinder_job) == [
             # no AMO_DISABLE_ADDON action because not an add-on target
-            CinderJob.DECISION_ACTIONS.AMO_BAN_USER,
-            CinderJob.DECISION_ACTIONS.AMO_APPROVE,
+            DECISION_ACTIONS.AMO_BAN_USER,
+            DECISION_ACTIONS.AMO_APPROVE,
         ]
 
-    def _test_process_decision_called(self, data, *, override):
+    def test_process_decision_called(self, data=None):
         abuse_report = self._setup_reports()
         addon_factory(guid=abuse_report.guid)
-        req = self.get_request(data=data)
+        req = self.get_request(data=data or self.get_data())
         with mock.patch.object(CinderJob, 'process_decision') as process_mock:
             response = cinder_webhook(req)
             process_mock.assert_called()
             process_mock.assert_called_with(
-                decision_id='d1f01fae-3bce-41d5-af8a-e0b4b5ceaaed',
-                decision_date=datetime(2023, 10, 12, 9, 8, 37, 4789),
-                decision_action=CinderJob.DECISION_ACTIONS.AMO_DISABLE_ADDON.value,
+                decision_cinder_id='d1f01fae-3bce-41d5-af8a-e0b4b5ceaaed',
+                decision_action=DECISION_ACTIONS.AMO_DISABLE_ADDON.value,
                 decision_notes='some notes',
                 policy_ids=['f73ad527-54ed-430c-86ff-80e15e2a352b'],
-                override=override,
             )
         assert response.status_code == 201
         assert response.data == {'amo': {'received': True, 'handled': True}}
 
-    def test_process_decision_called_not_override(self):
-        data = self.get_data()
-        return self._test_process_decision_called(data, override=False)
-
-    def test_process_decision_called_for_override(self):
-        data = self.get_data()
-        data['payload']['source']['decision']['type'] = 'override'
-        return self._test_process_decision_called(data, override=True)
-
-    def test_process_decision_called_for_appeal_confirm_approve(self):
-        data = self.get_data(filename='cinder_webhook_appeal_confirm_approve.json')
+    def test_process_decision_called_for_appeal_confirm_approve(
+        self, filename='reporter_appeal_confirm_approve.json'
+    ):
+        data = self.get_data(filename=filename)
         abuse_report = self._setup_reports()
-        addon_factory(guid=abuse_report.guid)
+        addon = addon_factory(guid=abuse_report.guid)
         original_cinder_job = CinderJob.objects.get()
         original_cinder_job.update(
-            decision_id='d1f01fae-3bce-41d5-af8a-e0b4b5ceaaed',
-            decision_date=datetime(2023, 10, 12, 9, 8, 37, 4789),
-            decision_action=CinderJob.DECISION_ACTIONS.AMO_APPROVE.value,
-            appeal_job=CinderJob.objects.create(
-                job_id='5c7c3e21-8ccd-4d2f-b3b4-429620bd7a63'
+            decision=ContentDecision.objects.create(
+                cinder_id='d1f01fae-3bce-41d5-af8a-e0b4b5ceaaed',
+                action=DECISION_ACTIONS.AMO_APPROVE,
+                appeal_job=CinderJob.objects.create(
+                    job_id='5c7c3e21-8ccd-4d2f-b3b4-429620bd7a63'
+                ),
+                addon=addon,
             ),
         )
         req = self.get_request(data=data)
@@ -961,68 +1299,206 @@ class TestCinderWebhook(TestCase):
             response = cinder_webhook(req)
         assert process_mock.call_count == 1
         process_mock.assert_called_with(
-            decision_id='76e0006d-1a42-4ec7-9475-148bab1970f1',
-            decision_date=datetime(2024, 1, 12, 15, 20, 19, 226428),
-            decision_action=CinderJob.DECISION_ACTIONS.AMO_APPROVE.value,
+            decision_cinder_id='76e0006d-1a42-4ec7-9475-148bab1970f1',
+            decision_action=DECISION_ACTIONS.AMO_APPROVE.value,
             decision_notes='still no!',
             policy_ids=['1c5d711a-78b7-4fc2-bdef-9a33024f5e8b'],
-            override=False,
         )
         assert response.status_code == 201
         assert response.data == {'amo': {'received': True, 'handled': True}}
 
-    def test_process_decision_called_for_appeal_disable(self):
-        data = self.get_data(filename='cinder_webhook_appeal_change_to_disable.json')
+    def test_process_decision_called_for_appeal_confirm_approve_with_override(self):
+        """This is to cover the unusual case in cinder where a moderator processes an
+        appeal by selecting to override the decision, but chooses to approve it again.
+        """
+        self.test_process_decision_called_for_appeal_confirm_approve(
+            filename='reporter_appeal_change_but_still_approve.json'
+        )
+
+    def test_process_decision_called_for_appeal_change_to_disable(self):
+        data = self.get_data(filename='reporter_appeal_change_to_disable.json')
         abuse_report = self._setup_reports()
-        addon_factory(guid=abuse_report.guid)
+        addon = addon_factory(guid=abuse_report.guid)
         original_cinder_job = CinderJob.objects.get()
         original_cinder_job.update(
-            decision_id='d1f01fae-3bce-41d5-af8a-e0b4b5ceaaed',
-            decision_date=datetime(2023, 10, 12, 9, 8, 37, 4789),
-            decision_action=CinderJob.DECISION_ACTIONS.AMO_APPROVE.value,
-            appeal_job=CinderJob.objects.create(
-                job_id='5ab7cb33-a5ab-4dfa-9d72-4c2061ffeb08'
-            ),
+            decision=ContentDecision.objects.create(
+                action_date=datetime(2023, 10, 12, 9, 8, 37, 4789),
+                cinder_id='d1f01fae-3bce-41d5-af8a-e0b4b5ceaaed',
+                action=DECISION_ACTIONS.AMO_APPROVE,
+                appeal_job=CinderJob.objects.create(
+                    job_id='5ab7cb33-a5ab-4dfa-9d72-4c2061ffeb08'
+                ),
+                addon=addon,
+            )
         )
         req = self.get_request(data=data)
         with mock.patch.object(CinderJob, 'process_decision') as process_mock:
             response = cinder_webhook(req)
         assert process_mock.call_count == 1
         process_mock.assert_called_with(
-            decision_id='4f18b22c-6078-4934-b395-6a2e01cadf63',
-            decision_date=datetime(2024, 1, 12, 14, 53, 23, 438634),
-            decision_action=CinderJob.DECISION_ACTIONS.AMO_DISABLE_ADDON.value,
+            decision_cinder_id='4f18b22c-6078-4934-b395-6a2e01cadf63',
+            decision_action=DECISION_ACTIONS.AMO_DISABLE_ADDON.value,
             decision_notes="fine I'll disable it",
-            policy_ids=['86d7bf98-288c-4e78-9a63-3f5db96847b1'],
-            override=True,
+            policy_ids=[
+                '7ea512a2-39a6-4cb6-91a0-2ed162192f7f',
+                'a5c96c92-2373-4d11-b573-61b0de00d8e0',
+            ],
         )
         assert response.status_code == 201
         assert response.data == {'amo': {'received': True, 'handled': True}}
+
+    def test_process_decision_called_for_override_to_approve(self):
+        abuse_report = self._setup_reports()
+        CinderJob.objects.get().update(
+            decision=ContentDecision.objects.create(
+                cinder_id='d1f01fae-3bce-41d5-af8a-e0b4b5ceaaed',
+                action=DECISION_ACTIONS.AMO_DISABLE_ADDON,
+                addon=addon_factory(guid=abuse_report.guid),
+            ),
+        )
+        req = self.get_request(
+            data=self.get_data(filename='override_change_to_approve.json')
+        )
+        with mock.patch.object(CinderJob, 'process_decision') as process_mock:
+            response = cinder_webhook(req)
+        assert process_mock.call_count == 1, response.data
+        process_mock.assert_called_with(
+            decision_cinder_id='3eacdc09-c292-4fcb-a56f-a3d45d5eefeb',
+            decision_action=DECISION_ACTIONS.AMO_APPROVE.value,
+            decision_notes='changed our mind',
+            policy_ids=['085f6a1c-46b6-44c2-a6ae-c3a73488aa1e'],
+        )
+        assert response.status_code == 201
+        assert response.data == {'amo': {'received': True, 'handled': True}}
+
+    def test_process_decision_triggers_emails_when_disable_confirmed(self):
+        data = self.get_data(filename='target_appeal_confirm_disable.json')
+        abuse_report = self._setup_reports()
+        author = user_factory()
+        addon = addon_factory(guid=abuse_report.guid, users=[author])
+        original_cinder_job = CinderJob.objects.get()
+        original_cinder_job.update(
+            decision=ContentDecision.objects.create(
+                action_date=datetime(2023, 10, 12, 9, 8, 37, 4789),
+                cinder_id='d1f01fae-3bce-41d5-af8a-e0b4b5ceaaed',
+                action=DECISION_ACTIONS.AMO_DISABLE_ADDON,
+                appeal_job=CinderJob.objects.create(
+                    job_id='5ab7cb33-a5ab-4dfa-9d72-4c2061ffeb08'
+                ),
+                addon=addon,
+            )
+        )
+        req = self.get_request(data=data)
+        with mock.patch.object(
+            ContentActionTargetAppealRemovalAffirmation, 'process_action'
+        ) as process_mock:
+            cinder_webhook(req)
+        process_mock.assert_called()
+        assert len(mail.outbox) == 1
+        assert mail.outbox[0].to == [author.email]
+        assert 'will not reinstate your Extension' in mail.outbox[0].body
+
+    def test_process_decision_triggers_emails_when_disable_reverted(self):
+        data = self.get_data(filename='target_appeal_change_to_approve.json')
+        abuse_report = self._setup_reports()
+        author = user_factory()
+        addon = addon_factory(guid=abuse_report.guid, users=[author])
+        original_cinder_job = CinderJob.objects.get()
+        original_cinder_job.update(
+            decision=ContentDecision.objects.create(
+                action_date=datetime(2023, 10, 12, 9, 8, 37, 4789),
+                cinder_id='d1f01fae-3bce-41d5-af8a-e0b4b5ceaaed',
+                action=DECISION_ACTIONS.AMO_DISABLE_ADDON,
+                appeal_job=CinderJob.objects.create(
+                    job_id='5ab7cb33-a5ab-4dfa-9d72-4c2061ffeb08'
+                ),
+                addon=addon,
+            )
+        )
+        req = self.get_request(data=data)
+        with mock.patch.object(
+            ContentActionTargetAppealApprove, 'process_action'
+        ) as process_mock:
+            cinder_webhook(req)
+        process_mock.assert_called()
+        assert len(mail.outbox) == 1
+        assert mail.outbox[0].to == [author.email]
+        assert 'we have restored your Extension' in mail.outbox[0].body
+
+    def test_process_decision_triggers_emails_for_reporter_appeal_disable(self):
+        data = self.get_data(filename='reporter_appeal_change_to_disable.json')
+        abuse_report = self._setup_reports()
+        author = user_factory()
+        addon = addon_factory(guid=abuse_report.guid, users=[author])
+        original_cinder_job = CinderJob.objects.get()
+        original_cinder_job.update(
+            decision=ContentDecision.objects.create(
+                action_date=datetime(2023, 10, 12, 9, 8, 37, 4789),
+                cinder_id='d1f01fae-3bce-41d5-af8a-e0b4b5ceaaed',
+                action=DECISION_ACTIONS.AMO_APPROVE,
+                appeal_job=CinderJob.objects.create(
+                    job_id='5ab7cb33-a5ab-4dfa-9d72-4c2061ffeb08'
+                ),
+                addon=addon,
+            )
+        )
+        abuse_report.update(
+            reporter_email='reporter@email.com', cinder_job=original_cinder_job
+        )
+        CinderAppeal.objects.create(
+            decision=original_cinder_job.decision, reporter_report=abuse_report
+        )
+        req = self.get_request(data=data)
+        with mock.patch.object(
+            ContentActionDisableAddon, 'process_action'
+        ) as process_mock:
+            cinder_webhook(req)
+        process_mock.assert_called()
+        assert len(mail.outbox) == 2
+        assert mail.outbox[0].to == ['reporter@email.com']
+        assert 'was incorrect' in mail.outbox[0].body
+        assert mail.outbox[1].to == [author.email]
+        assert 'has been permanently disabled' in mail.outbox[1].body
+
+    def test_process_decision_triggers_no_target_email_for_reporter_approve(self):
+        data = self.get_data(filename='reporter_appeal_confirm_approve.json')
+        abuse_report = self._setup_reports()
+        author = user_factory()
+        addon = addon_factory(guid=abuse_report.guid, users=[author])
+        original_cinder_job = CinderJob.objects.get()
+        original_cinder_job.update(
+            decision=ContentDecision.objects.create(
+                action_date=datetime(2023, 10, 12, 9, 8, 37, 4789),
+                cinder_id='d1f01fae-3bce-41d5-af8a-e0b4b5ceaaed',
+                action=DECISION_ACTIONS.AMO_APPROVE,
+                appeal_job=CinderJob.objects.create(
+                    job_id='5c7c3e21-8ccd-4d2f-b3b4-429620bd7a63'
+                ),
+                addon=addon,
+            )
+        )
+        abuse_report.update(
+            reporter_email='reporter@email.com', cinder_job=original_cinder_job
+        )
+        CinderAppeal.objects.create(
+            decision=original_cinder_job.decision, reporter_report=abuse_report
+        )
+        req = self.get_request(data=data)
+        with mock.patch.object(
+            ContentActionApproveNoAction, 'process_action'
+        ) as process_mock:
+            cinder_webhook(req)
+        process_mock.assert_called()
+        assert len(mail.outbox) == 1
+        assert mail.outbox[0].to == ['reporter@email.com']
+        assert 'we have denied your appeal' in mail.outbox[0].body
 
     def test_queue_does_not_matter_non_reviewer_case(self):
         data = self.get_data()
         data['payload']['source']['job']['queue']['slug'] = 'amo-another-queue'
-        return self._test_process_decision_called(data, override=False)
+        return self.test_process_decision_called(data)
 
-    def test_queue_handled_reviewer_queue_ignored(self):
-        data = self.get_data()
-        data['payload']['source']['job']['queue']['slug'] = 'amo-addon-infringement'
-        abuse_report = self._setup_reports()
-        addon_factory(guid=abuse_report.guid)
-        req = self.get_request(data=data)
-        with mock.patch.object(CinderJob, 'process_decision') as process_mock:
-            response = cinder_webhook(req)
-            process_mock.assert_not_called()
-        assert response.status_code == 200
-        assert response.data == {
-            'amo': {
-                'received': True,
-                'handled': False,
-                'not_handled_reason': 'Queue handled by AMO reviewers',
-            }
-        }
-
-    def test_not_decision_event(self):
+    def test_unknown_event(self):
         self._setup_reports()
         data = self.get_data()
         data['event'] = 'report.created'
@@ -1035,11 +1511,35 @@ class TestCinderWebhook(TestCase):
             'amo': {
                 'received': True,
                 'handled': False,
-                'not_handled_reason': 'Not a decision',
+                'not_handled_reason': 'report.created is not a event we support',
             }
         }
 
-    def test_no_cinder_report(self):
+    def test_missing_payload(self):
+        expected = {
+            'amo': {
+                'received': True,
+                'handled': False,
+                'not_handled_reason': 'No payload dict',
+            }
+        }
+
+        def check(response):
+            process_mock.assert_not_called()
+            assert response.status_code == 200
+            assert response.data == expected
+
+        self._setup_reports()
+        data = self.get_data()
+        with mock.patch.object(CinderJob, 'process_decision') as process_mock:
+            del data['payload']
+            check(cinder_webhook(self.get_request(data=data)))
+            data['payload'] = 'string'
+            check(cinder_webhook(self.get_request(data=data)))
+            data['payload'] = {}
+            check(cinder_webhook(self.get_request(data=data)))
+
+    def test_no_cinder_job(self):
         req = self.get_request()
         with mock.patch.object(CinderJob, 'process_decision') as process_mock:
             response = cinder_webhook(req)
@@ -1050,6 +1550,60 @@ class TestCinderWebhook(TestCase):
                 'received': True,
                 'handled': False,
                 'not_handled_reason': 'No matching job id found',
+            }
+        }
+
+    def test_no_decision(self):
+        req = self.get_request(
+            data=self.get_data(filename='override_change_to_approve.json')
+        )
+        with mock.patch.object(CinderJob, 'process_decision') as process_mock:
+            response = cinder_webhook(req)
+            process_mock.assert_not_called()
+        assert response.status_code == 200
+        assert response.data == {
+            'amo': {
+                'received': True,
+                'handled': False,
+                'not_handled_reason': 'No matching decision id found',
+            }
+        }
+
+    def test_valid_decision_but_no_cinder_job(self):
+        abuse_report = self._setup_reports()
+        ContentDecision.objects.create(
+            cinder_id='d1f01fae-3bce-41d5-af8a-e0b4b5ceaaed',
+            action=DECISION_ACTIONS.AMO_DISABLE_ADDON,
+            addon=addon_factory(guid=abuse_report.guid),
+        )
+        req = self.get_request(
+            data=self.get_data(filename='override_change_to_approve.json')
+        )
+        with mock.patch.object(CinderJob, 'process_decision') as process_mock:
+            response = cinder_webhook(req)
+            process_mock.assert_not_called()
+        assert response.status_code == 200
+        assert response.data == {
+            'amo': {
+                'received': True,
+                'handled': False,
+                'not_handled_reason': 'No matching job found for decision id',
+            }
+        }
+
+    def test_reviewer_tools_resolved_cinder_job(self):
+        report = self._setup_reports()
+        report.cinder_job.update(resolvable_in_reviewer_tools=True)
+        req = self.get_request()
+        with mock.patch.object(CinderJob, 'process_decision') as process_mock:
+            response = cinder_webhook(req)
+            process_mock.assert_not_called()
+        assert response.status_code == 200
+        assert response.data == {
+            'amo': {
+                'received': True,
+                'handled': False,
+                'not_handled_reason': 'Decision already handled via reviewer tools',
             }
         }
 
@@ -1100,6 +1654,69 @@ class TestCinderWebhook(TestCase):
             }
         }
 
+    def test_process_queue_move_called(self):
+        abuse_report = self._setup_reports()
+        addon_factory(guid=abuse_report.guid)
+        req = self.get_request(
+            data=self.get_data('job_actioned_move_to_dev_infringement.json')
+        )
+        with mock.patch.object(CinderJob, 'process_queue_move') as process_mock:
+            response = cinder_webhook(req)
+            process_mock.assert_called()
+            process_mock.assert_called_with(
+                new_queue='amo-env-addon-infringement', notes='no'
+            )
+        assert response.status_code == 201
+        assert response.data == {'amo': {'received': True, 'handled': True}}
+
+    def test_process_queue_move_no_cinder_report(self):
+        req = self.get_request(
+            data=self.get_data('job_actioned_move_to_dev_infringement.json')
+        )
+        with mock.patch.object(CinderJob, 'process_queue_move') as process_mock:
+            response = cinder_webhook(req)
+            process_mock.assert_not_called()
+        assert response.status_code == 200
+        assert response.data == {
+            'amo': {
+                'received': True,
+                'handled': False,
+                'not_handled_reason': 'No matching job id found',
+            }
+        }
+
+    def test_process_queue_move_invalid_action(self):
+        data = self.get_data('job_actioned_move_to_dev_infringement.json')
+
+        data['payload']['action'] = 'something_else'
+        response = cinder_webhook(self.get_request(data=data))
+        assert response.status_code == 200
+        assert response.data == {
+            'amo': {
+                'received': True,
+                'handled': False,
+                'not_handled_reason': (
+                    'Unsupported action (something_else) for job.actioned'
+                ),
+            }
+        }
+
+    def test_process_queue_move_not_addon(self):
+        data = self.get_data('job_actioned_move_to_dev_infringement.json')
+
+        data['payload']['job']['entity']['entity_schema'] = 'amo_user'
+        response = cinder_webhook(self.get_request(data=data))
+        assert response.status_code == 200
+        assert response.data == {
+            'amo': {
+                'received': True,
+                'handled': False,
+                'not_handled_reason': (
+                    'Unsupported entity_schema (amo_user) for job.actioned'
+                ),
+            }
+        }
+
     def test_set_user(self):
         set_user(user_factory())
         req = self.get_request()
@@ -1131,6 +1748,8 @@ class RatingAbuseViewSetTestBase:
                 'rating': str(target_rating.pk),
                 'message': 'abuse!',
                 'reason': 'illegal',
+                'illegal_category': 'animal_welfare',
+                'illegal_subcategory': 'other',
             },
             REMOTE_ADDR='123.45.67.89',
         )
@@ -1150,6 +1769,8 @@ class RatingAbuseViewSetTestBase:
                 'rating': target_rating.pk,
                 'message': 'abuse!',
                 'reason': 'illegal',
+                'illegal_category': 'animal_welfare',
+                'illegal_subcategory': 'other',
             },
             REMOTE_ADDR='123.45.67.89',
         )
@@ -1161,7 +1782,13 @@ class RatingAbuseViewSetTestBase:
 
     def test_no_rating_fails(self):
         response = self.client.post(
-            self.url, data={'message': 'abuse!', 'reason': 'illegal'}
+            self.url,
+            data={
+                'message': 'abuse!',
+                'reason': 'illegal',
+                'illegal_category': 'animal_welfare',
+                'illegal_subcategory': 'other',
+            },
         )
         assert response.status_code == 400
         assert json.loads(response.content) == {'rating': ['This field is required.']}
@@ -1189,7 +1816,13 @@ class RatingAbuseViewSetTestBase:
         )
         response = self.client.post(
             self.url,
-            data={'rating': str(target_rating.pk), 'message': '', 'reason': 'illegal'},
+            data={
+                'rating': str(target_rating.pk),
+                'message': '',
+                'reason': 'illegal',
+                'illegal_category': 'animal_welfare',
+                'illegal_subcategory': 'other',
+            },
         )
         assert response.status_code == 201
 
@@ -1199,7 +1832,12 @@ class RatingAbuseViewSetTestBase:
         )
         response = self.client.post(
             self.url,
-            data={'rating': str(target_rating.pk), 'reason': 'illegal'},
+            data={
+                'rating': str(target_rating.pk),
+                'reason': 'illegal',
+                'illegal_category': 'animal_welfare',
+                'illegal_subcategory': 'other',
+            },
         )
         assert response.status_code == 201
 
@@ -1235,6 +1873,8 @@ class RatingAbuseViewSetTestBase:
                     'rating': str(target_rating.pk),
                     'message': 'abuse!',
                     'reason': 'illegal',
+                    'illegal_category': 'animal_welfare',
+                    'illegal_subcategory': 'other',
                 },
                 REMOTE_ADDR='123.45.67.89',
                 HTTP_X_FORWARDED_FOR=f'123.45.67.89, {get_random_ip()}',
@@ -1247,6 +1887,8 @@ class RatingAbuseViewSetTestBase:
                 'rating': str(target_rating.pk),
                 'message': 'abuse!',
                 'reason': 'illegal',
+                'illegal_category': 'animal_welfare',
+                'illegal_subcategory': 'other',
             },
             REMOTE_ADDR='123.45.67.89',
             HTTP_X_FORWARDED_FOR=f'123.45.67.89, {get_random_ip()}',
@@ -1263,6 +1905,8 @@ class RatingAbuseViewSetTestBase:
                 'rating': str(target_rating.pk),
                 'message': 'abuse!',
                 'reason': 'illegal',
+                'illegal_category': 'animal_welfare',
+                'illegal_subcategory': 'other',
             },
             REMOTE_ADDR='123.45.67.89',
             HTTP_X_COUNTRY_CODE='YY',
@@ -1287,13 +1931,13 @@ class RatingAbuseViewSetTestBase:
         assert response.status_code == 201, response.content
 
     @mock.patch('olympia.abuse.tasks.report_to_cinder.delay')
-    @override_switch('enable-cinder-reporting', active=True)
+    @override_switch('dsa-job-technical-processing', active=True)
     def test_reportable_reason_calls_cinder_task(self, task_mock):
         self._setup_reportable_reason('hateful_violent_deceptive')
         task_mock.assert_called()
 
     @mock.patch('olympia.abuse.tasks.report_to_cinder.delay')
-    @override_switch('enable-cinder-reporting', active=False)
+    @override_switch('dsa-job-technical-processing', active=False)
     def test_reportable_reason_does_not_call_cinder_with_waffle_off(self, task_mock):
         self._setup_reportable_reason('hateful_violent_deceptive')
         task_mock.assert_not_called()
@@ -1309,6 +1953,8 @@ class RatingAbuseViewSetTestBase:
                 'message': 'abuse!',
                 'reason': 'illegal',
                 'lang': 'Lô-käl',
+                'illegal_category': 'animal_welfare',
+                'illegal_subcategory': 'other',
             },
             REMOTE_ADDR='123.45.67.89',
         )
@@ -1317,6 +1963,172 @@ class RatingAbuseViewSetTestBase:
         report = AbuseReport.objects.get(rating=target_rating)
         self.check_report(report, f'Abuse Report for Rating {target_rating.pk}')
         assert report.application_locale == 'Lô-käl'
+
+    def test_reject_illegal_category_when_reason_is_not_illegal(self):
+        target_rating = Rating.objects.create(
+            addon=addon_factory(), user=user_factory(), body='Booh', rating=1
+        )
+        response = self.client.post(
+            self.url,
+            data={
+                'rating': str(target_rating.pk),
+                'reason': 'feedback_spam',
+                'illegal_category': 'other',
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_category': [
+                'This value must be omitted or set to "null" when the `reason` is '
+                'not "illegal".'
+            ],
+        }
+
+    def test_reject_illegal_subcategory_when_reason_is_not_illegal(self):
+        target_rating = Rating.objects.create(
+            addon=addon_factory(), user=user_factory(), body='Booh', rating=1
+        )
+        response = self.client.post(
+            self.url,
+            data={
+                'rating': str(target_rating.pk),
+                'reason': 'feedback_spam',
+                'illegal_subcategory': 'other',
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_subcategory': [
+                'This value must be omitted or set to "null" when the `reason` is '
+                'not "illegal".'
+            ],
+        }
+
+    def test_illegal_category_required_when_reason_is_illegal(self):
+        target_rating = Rating.objects.create(
+            addon=addon_factory(), user=user_factory(), body='Booh', rating=1
+        )
+        response = self.client.post(
+            self.url, data={'rating': str(target_rating.pk), 'reason': 'illegal'}
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_category': ['This field is required.']
+        }
+
+    def test_illegal_category_cannot_be_blank_when_reason_is_illegal(self):
+        target_rating = Rating.objects.create(
+            addon=addon_factory(), user=user_factory(), body='Booh', rating=1
+        )
+        response = self.client.post(
+            self.url,
+            data={
+                'rating': str(target_rating.pk),
+                'reason': 'illegal',
+                'illegal_category': '',
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_category': ['"" is not a valid choice.']
+        }
+
+    def test_illegal_category_cannot_be_null_when_reason_is_illegal(self):
+        target_rating = Rating.objects.create(
+            addon=addon_factory(), user=user_factory(), body='Booh', rating=1
+        )
+        response = self.client.post(
+            self.url,
+            data={
+                'rating': str(target_rating.pk),
+                'reason': 'illegal',
+                'illegal_category': None,
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_category': ['This field may not be null.']
+        }
+
+    def test_illegal_subcategory_required_when_reason_is_illegal(self):
+        target_rating = Rating.objects.create(
+            addon=addon_factory(), user=user_factory(), body='Booh', rating=1
+        )
+        response = self.client.post(
+            self.url,
+            data={
+                'rating': str(target_rating.pk),
+                'reason': 'illegal',
+                'illegal_category': 'animal_welfare',
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_subcategory': ['This field is required.']
+        }
+
+    def test_illegal_subcategory_cannot_be_blank_when_reason_is_illegal(self):
+        target_rating = Rating.objects.create(
+            addon=addon_factory(), user=user_factory(), body='Booh', rating=1
+        )
+        response = self.client.post(
+            self.url,
+            data={
+                'rating': str(target_rating.pk),
+                'reason': 'illegal',
+                'illegal_category': 'animal_welfare',
+                'illegal_subcategory': '',
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_subcategory': ['"" is not a valid choice.']
+        }
+
+    def test_illegal_subcategory_cannot_be_null_when_reason_is_illegal(self):
+        target_rating = Rating.objects.create(
+            addon=addon_factory(),
+            user=user_factory(),
+            body='Booh',
+            rating=1,
+        )
+        response = self.client.post(
+            self.url,
+            data={
+                'rating': str(target_rating.pk),
+                'reason': 'illegal',
+                'illegal_category': 'animal_welfare',
+                'illegal_subcategory': None,
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_subcategory': ['This field may not be null.']
+        }
+
+    def test_illegal_subcategory_depends_on_category(self):
+        target_rating = Rating.objects.create(
+            addon=addon_factory(),
+            user=user_factory(),
+            body='Booh',
+            rating=1,
+        )
+        response = self.client.post(
+            self.url,
+            data={
+                'rating': str(target_rating.pk),
+                'reason': 'illegal',
+                'illegal_category': 'animal_welfare',
+                'illegal_subcategory': 'biometric_data_breach',
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_subcategory': [
+                'This value cannot be used in combination with the supplied '
+                '`illegal_category`.'
+            ]
+        }
 
 
 class TestRatingAbuseViewSetLoggedOut(RatingAbuseViewSetTestBase, TestCase):
@@ -1346,6 +2158,8 @@ class TestRatingAbuseViewSetLoggedIn(RatingAbuseViewSetTestBase, TestCase):
                     'rating': str(target_rating.pk),
                     'message': 'abuse!',
                     'reason': 'illegal',
+                    'illegal_category': 'animal_welfare',
+                    'illegal_subcategory': 'other',
                 },
                 REMOTE_ADDR='123.45.67.89',
                 HTTP_X_FORWARDED_FOR=f'123.45.67.89, {get_random_ip()}',
@@ -1361,6 +2175,8 @@ class TestRatingAbuseViewSetLoggedIn(RatingAbuseViewSetTestBase, TestCase):
                 'rating': str(target_rating.pk),
                 'message': 'abuse!',
                 'reason': 'illegal',
+                'illegal_category': 'animal_welfare',
+                'illegal_subcategory': 'other',
             },
             REMOTE_ADDR='123.45.67.89',
             HTTP_X_FORWARDED_FOR=f'123.45.67.89, {get_random_ip()}',
@@ -1447,6 +2263,8 @@ class CollectionAbuseViewSetTestBase:
                 'collection': str(target_collection.pk),
                 'message': '',
                 'reason': 'illegal',
+                'illegal_category': 'animal_welfare',
+                'illegal_subcategory': 'other',
             },
         )
         assert response.status_code == 201
@@ -1455,7 +2273,12 @@ class CollectionAbuseViewSetTestBase:
         target_collection = collection_factory()
         response = self.client.post(
             self.url,
-            data={'collection': str(target_collection.pk), 'reason': 'illegal'},
+            data={
+                'collection': str(target_collection.pk),
+                'reason': 'illegal',
+                'illegal_category': 'animal_welfare',
+                'illegal_subcategory': 'other',
+            },
         )
         assert response.status_code == 201
 
@@ -1487,6 +2310,8 @@ class CollectionAbuseViewSetTestBase:
                     'collection': str(target_collection.pk),
                     'message': 'abuse!',
                     'reason': 'illegal',
+                    'illegal_category': 'animal_welfare',
+                    'illegal_subcategory': 'other',
                 },
                 REMOTE_ADDR='123.45.67.89',
                 HTTP_X_FORWARDED_FOR=f'123.45.67.89, {get_random_ip()}',
@@ -1499,6 +2324,8 @@ class CollectionAbuseViewSetTestBase:
                 'collection': str(target_collection.pk),
                 'message': 'abuse!',
                 'reason': 'illegal',
+                'illegal_category': 'animal_welfare',
+                'illegal_subcategory': 'other',
             },
             REMOTE_ADDR='123.45.67.89',
             HTTP_X_FORWARDED_FOR=f'123.45.67.89, {get_random_ip()}',
@@ -1513,6 +2340,8 @@ class CollectionAbuseViewSetTestBase:
                 'collection': str(target_collection.pk),
                 'message': 'abuse!',
                 'reason': 'illegal',
+                'illegal_category': 'animal_welfare',
+                'illegal_subcategory': 'other',
             },
             REMOTE_ADDR='123.45.67.89',
             HTTP_X_COUNTRY_CODE='YY',
@@ -1539,13 +2368,13 @@ class CollectionAbuseViewSetTestBase:
         assert response.status_code == 201, response.content
 
     @mock.patch('olympia.abuse.tasks.report_to_cinder.delay')
-    @override_switch('enable-cinder-reporting', active=True)
+    @override_switch('dsa-job-technical-processing', active=True)
     def test_reportable_reason_calls_cinder_task(self, task_mock):
         self._setup_reportable_reason('hateful_violent_deceptive')
         task_mock.assert_called()
 
     @mock.patch('olympia.abuse.tasks.report_to_cinder.delay')
-    @override_switch('enable-cinder-reporting', active=False)
+    @override_switch('dsa-job-technical-processing', active=False)
     def test_reportable_reason_does_not_call_cinder_with_waffle_off(self, task_mock):
         self._setup_reportable_reason('hateful_violent_deceptive')
         task_mock.assert_not_called()
@@ -1567,6 +2396,149 @@ class CollectionAbuseViewSetTestBase:
         report = AbuseReport.objects.get(collection=target_collection)
         self.check_report(report, f'Abuse Report for Collection {target_collection.pk}')
         assert report.application_locale == 'Lô-käl'
+
+    def test_reject_illegal_category_when_reason_is_not_illegal(self):
+        target_collection = collection_factory()
+        response = self.client.post(
+            self.url,
+            data={
+                'collection': str(target_collection.pk),
+                'reason': 'feedback_spam',
+                'illegal_category': 'other',
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_category': [
+                'This value must be omitted or set to "null" when the `reason` is '
+                'not "illegal".'
+            ],
+        }
+
+    def test_reject_illegal_subcategory_when_reason_is_not_illegal(self):
+        target_collection = collection_factory()
+        response = self.client.post(
+            self.url,
+            data={
+                'collection': str(target_collection.pk),
+                'reason': 'feedback_spam',
+                'illegal_subcategory': 'other',
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_subcategory': [
+                'This value must be omitted or set to "null" when the `reason` is '
+                'not "illegal".'
+            ],
+        }
+
+    def test_illegal_category_required_when_reason_is_illegal(self):
+        target_collection = collection_factory()
+        response = self.client.post(
+            self.url,
+            data={'collection': str(target_collection.pk), 'reason': 'illegal'},
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_category': ['This field is required.']
+        }
+
+    def test_illegal_category_cannot_be_blank_when_reason_is_illegal(self):
+        target_collection = collection_factory()
+        response = self.client.post(
+            self.url,
+            data={
+                'collection': str(target_collection.pk),
+                'reason': 'illegal',
+                'illegal_category': '',
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_category': ['"" is not a valid choice.']
+        }
+
+    def test_illegal_category_cannot_be_null_when_reason_is_illegal(self):
+        target_collection = collection_factory()
+        response = self.client.post(
+            self.url,
+            data={
+                'collection': str(target_collection.pk),
+                'reason': 'illegal',
+                'illegal_category': None,
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_category': ['This field may not be null.']
+        }
+
+    def test_illegal_subcategory_required_when_reason_is_illegal(self):
+        target_collection = collection_factory()
+        response = self.client.post(
+            self.url,
+            data={
+                'collection': str(target_collection.pk),
+                'reason': 'illegal',
+                'illegal_category': 'animal_welfare',
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_subcategory': ['This field is required.']
+        }
+
+    def test_illegal_subcategory_cannot_be_blank_when_reason_is_illegal(self):
+        target_collection = collection_factory()
+        response = self.client.post(
+            self.url,
+            data={
+                'collection': str(target_collection.pk),
+                'reason': 'illegal',
+                'illegal_category': 'animal_welfare',
+                'illegal_subcategory': '',
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_subcategory': ['"" is not a valid choice.']
+        }
+
+    def test_illegal_subcategory_cannot_be_null_when_reason_is_illegal(self):
+        target_collection = collection_factory()
+        response = self.client.post(
+            self.url,
+            data={
+                'collection': str(target_collection.pk),
+                'reason': 'illegal',
+                'illegal_category': 'animal_welfare',
+                'illegal_subcategory': None,
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_subcategory': ['This field may not be null.']
+        }
+
+    def test_illegal_subcategory_depends_on_category(self):
+        target_collection = collection_factory()
+        response = self.client.post(
+            self.url,
+            data={
+                'collection': str(target_collection.pk),
+                'reason': 'illegal',
+                'illegal_category': 'animal_welfare',
+                'illegal_subcategory': 'biometric_data_breach',
+            },
+        )
+        assert response.status_code == 400
+        assert json.loads(response.content) == {
+            'illegal_subcategory': [
+                'This value cannot be used in combination with the supplied '
+                '`illegal_category`.'
+            ]
+        }
 
 
 class TestCollectionAbuseViewSetLoggedOut(CollectionAbuseViewSetTestBase, TestCase):
@@ -1594,6 +2566,8 @@ class TestCollectionAbuseViewSetLoggedIn(CollectionAbuseViewSetTestBase, TestCas
                     'collection': str(target_collection.pk),
                     'message': 'abuse!',
                     'reason': 'illegal',
+                    'illegal_category': 'animal_welfare',
+                    'illegal_subcategory': 'other',
                 },
                 REMOTE_ADDR='123.45.67.89',
                 HTTP_X_FORWARDED_FOR=f'123.45.67.89, {get_random_ip()}',
@@ -1609,6 +2583,8 @@ class TestCollectionAbuseViewSetLoggedIn(CollectionAbuseViewSetTestBase, TestCas
                 'collection': str(target_collection.pk),
                 'message': 'abuse!',
                 'reason': 'illegal',
+                'illegal_category': 'animal_welfare',
+                'illegal_subcategory': 'other',
             },
             REMOTE_ADDR='123.45.67.89',
             HTTP_X_FORWARDED_FOR=f'123.45.67.89, {get_random_ip()}',
@@ -1620,9 +2596,12 @@ class TestAppeal(TestCase):
     def setUp(self):
         self.addon = addon_factory()
         self.cinder_job = CinderJob.objects.create(
-            decision_id='my-decision-id',
-            decision_action=CinderJob.DECISION_ACTIONS.AMO_APPROVE,
-            decision_date=self.days_ago(1),
+            decision=ContentDecision.objects.create(
+                cinder_id='my-decision-id',
+                action=DECISION_ACTIONS.AMO_APPROVE,
+                action_date=self.days_ago(1),
+                addon=self.addon,
+            ),
             created=self.days_ago(2),
         )
         self.abuse_report = AbuseReport.objects.create(
@@ -1635,13 +2614,13 @@ class TestAppeal(TestCase):
             'abuse.appeal_reporter',
             kwargs={
                 'abuse_report_id': self.abuse_report.id,
-                'decision_id': self.cinder_job.decision_id,
+                'decision_cinder_id': self.cinder_job.decision.cinder_id,
             },
         )
         self.author_appeal_url = reverse(
             'abuse.appeal_author',
             kwargs={
-                'decision_id': self.cinder_job.decision_id,
+                'decision_cinder_id': self.cinder_job.decision.cinder_id,
             },
         )
         patcher = mock.patch('olympia.abuse.views.appeal_to_cinder')
@@ -1649,7 +2628,7 @@ class TestAppeal(TestCase):
         self.appeal_mock = patcher.start()
 
     def test_no_decision_yet(self):
-        self.cinder_job.update(decision_action=CinderJob.DECISION_ACTIONS.NO_DECISION)
+        self.cinder_job.decision.delete()
         assert self.client.get(self.reporter_appeal_url).status_code == 404
         assert self.client.get(self.author_appeal_url).status_code == 404
 
@@ -1658,7 +2637,7 @@ class TestAppeal(TestCase):
             'abuse.appeal_reporter',
             kwargs={
                 'abuse_report_id': self.abuse_report.id,
-                'decision_id': '1234-5678-9000',
+                'decision_cinder_id': '1234-5678-9000',
             },
         )
         assert self.client.get(url).status_code == 404
@@ -1666,7 +2645,7 @@ class TestAppeal(TestCase):
         url = reverse(
             'abuse.appeal_author',
             kwargs={
-                'decision_id': '1234-5678-9000',
+                'decision_cinder_id': '1234-5678-9000',
             },
         )
         assert self.client.get(url).status_code == 404
@@ -1676,7 +2655,7 @@ class TestAppeal(TestCase):
             'abuse.appeal_reporter',
             kwargs={
                 'abuse_report_id': self.abuse_report.id + 1,
-                'decision_id': self.cinder_job.decision_id,
+                'decision_cinder_id': self.cinder_job.decision.cinder_id,
             },
         )
         assert self.client.get(url).status_code == 404
@@ -1740,14 +2719,14 @@ class TestAppeal(TestCase):
         assert self.appeal_mock.delay.call_args_list[0][0] == ()
         assert self.appeal_mock.delay.call_args_list[0][1] == {
             'appeal_text': 'I dont like this',
-            'decision_id': self.cinder_job.decision_id,
+            'decision_cinder_id': self.cinder_job.decision.cinder_id,
             'abuse_report_id': self.abuse_report.id,
             'user_id': None,
             'is_reporter': True,
         }
 
     def test_appeal_approval_anonymous_report_with_email_post_cant_be_appealed(self):
-        self.cinder_job.update(decision_date=self.days_ago(200))
+        self.cinder_job.decision.update(action_date=self.days_ago(200))
         self.abuse_report.update(reporter_email='me@example.com')
         response = self.client.get(self.reporter_appeal_url)
         assert response.status_code == 200
@@ -1802,7 +2781,7 @@ class TestAppeal(TestCase):
         assert self.appeal_mock.call_count == 0
 
     def test_appeal_approval_logged_in_report_cant_be_appealed(self):
-        self.cinder_job.update(decision_date=self.days_ago(200))
+        self.cinder_job.decision.update(action_date=self.days_ago(200))
         self.user = user_factory()
         self.abuse_report.update(reporter=self.user)
         self.client.force_login(self.user)
@@ -1817,25 +2796,19 @@ class TestAppeal(TestCase):
         assert self.appeal_mock.call_count == 0
 
     def test_appeal_rejection_not_logged_in(self):
-        self.cinder_job.update(
-            decision_action=CinderJob.DECISION_ACTIONS.AMO_DISABLE_ADDON
-        )
+        self.cinder_job.decision.update(action=DECISION_ACTIONS.AMO_DISABLE_ADDON)
         response = self.client.get(self.author_appeal_url)
         self.assertLoginRedirects(response, self.author_appeal_url)
 
     def test_appeal_rejection_not_author(self):
-        self.cinder_job.update(
-            decision_action=CinderJob.DECISION_ACTIONS.AMO_DISABLE_ADDON
-        )
+        self.cinder_job.decision.update(action=DECISION_ACTIONS.AMO_DISABLE_ADDON)
         user = user_factory()
         self.client.force_login(user)
         response = self.client.get(self.author_appeal_url)
         assert response.status_code == 403
 
     def test_appeal_rejection_author(self):
-        self.cinder_job.update(
-            decision_action=CinderJob.DECISION_ACTIONS.AMO_DISABLE_ADDON
-        )
+        self.cinder_job.decision.update(action=DECISION_ACTIONS.AMO_DISABLE_ADDON)
         user = user_factory()
         self.addon.authors.add(user)
         self.client.force_login(user)
@@ -1860,18 +2833,59 @@ class TestAppeal(TestCase):
         assert self.appeal_mock.delay.call_args_list[0][0] == ()
         assert self.appeal_mock.delay.call_args_list[0][1] == {
             'appeal_text': 'I dont like this',
-            'decision_id': self.cinder_job.decision_id,
+            'decision_cinder_id': self.cinder_job.decision.cinder_id,
+            'abuse_report_id': None,
+            'user_id': user.pk,
+            'is_reporter': False,
+        }
+
+    def test_appeal_rejection_author_no_cinderjob(self):
+        user = user_factory()
+        self.addon.authors.add(user)
+        self.client.force_login(user)
+        decision = ContentDecision.objects.create(
+            addon=self.addon,
+            action=DECISION_ACTIONS.AMO_DISABLE_ADDON,
+            cinder_id='some-decision-id',
+            action_date=datetime.now(),
+        )
+        author_appeal_url = reverse(
+            'abuse.appeal_author', kwargs={'decision_cinder_id': decision.cinder_id}
+        )
+        response = self.client.get(author_appeal_url)
+        assert response.status_code == 200
+        doc = pq(response.content)
+        assert not doc('#id_email')
+        assert not doc('#appeal-thank-you')
+        assert doc('#id_reason')
+        assert doc('#appeal-submit')
+
+        response = self.client.post(
+            author_appeal_url,
+            {'email': 'me@example.com', 'reason': 'I dont like this'},
+        )
+        assert response.status_code == 200
+        doc = pq(response.content)
+        assert doc('#appeal-thank-you')
+        assert not doc('#id_reason')
+        assert not doc('#appeal-submit')
+        assert self.appeal_mock.delay.call_count == 1
+        assert self.appeal_mock.delay.call_args_list[0][0] == ()
+        assert self.appeal_mock.delay.call_args_list[0][1] == {
+            'appeal_text': 'I dont like this',
+            'decision_cinder_id': decision.cinder_id,
             'abuse_report_id': None,
             'user_id': user.pk,
             'is_reporter': False,
         }
 
     def test_appeal_banned_user(self):
-        self.cinder_job.update(decision_action=CinderJob.DECISION_ACTIONS.AMO_BAN_USER)
-        self.abuse_report.update(guid=None, user=user_factory())
-        response = self.client.post(
-            self.author_appeal_url, {'email': self.abuse_report.user.email}
+        target = user_factory()
+        self.cinder_job.decision.update(
+            action=DECISION_ACTIONS.AMO_BAN_USER, addon=None, user=target
         )
+        self.abuse_report.update(guid=None, user=target)
+        response = self.client.post(self.author_appeal_url, {'email': target.email})
         assert response.status_code == 200
         doc = pq(response.content)
         email_input = doc('#id_email')[0]
@@ -1883,7 +2897,7 @@ class TestAppeal(TestCase):
 
         response = self.client.post(
             self.author_appeal_url,
-            {'email': self.abuse_report.user.email, 'reason': 'I am not a bad guy'},
+            {'email': target.email, 'reason': 'I am not a bad guy'},
         )
         assert response.status_code == 200
         doc = pq(response.content)
@@ -1894,15 +2908,18 @@ class TestAppeal(TestCase):
         assert self.appeal_mock.delay.call_args_list[0][0] == ()
         assert self.appeal_mock.delay.call_args_list[0][1] == {
             'appeal_text': 'I am not a bad guy',
-            'decision_id': self.cinder_job.decision_id,
+            'decision_cinder_id': self.cinder_job.decision.cinder_id,
             'abuse_report_id': None,
             'user_id': None,
             'is_reporter': False,
         }
 
     def test_appeal_banned_user_wrong_email(self):
-        self.cinder_job.update(decision_action=CinderJob.DECISION_ACTIONS.AMO_BAN_USER)
-        self.abuse_report.update(guid=None, user=user_factory())
+        target = user_factory()
+        self.cinder_job.decision.update(
+            action=DECISION_ACTIONS.AMO_BAN_USER, addon=None, user=target
+        )
+        self.abuse_report.update(guid=None, user=target)
         response = self.client.post(self.author_appeal_url, {'email': 'me@example.com'})
         assert response.status_code == 200
         doc = pq(response.content)
@@ -1941,8 +2958,10 @@ class TestAppeal(TestCase):
             reporter_email='otherreporter@example.com',
         )
         appeal_job = CinderJob.objects.create(job_id='appeal job id')
-        self.cinder_job.update(appeal_job=appeal_job)
-        other_abuse_report.update(appellant_job=appeal_job)
+        self.cinder_job.decision.update(appeal_job=appeal_job)
+        CinderAppeal.objects.create(
+            decision=self.cinder_job.decision, reporter_report=other_abuse_report
+        )
 
         self.client.force_login(user)
         response = self.client.get(self.reporter_appeal_url)
@@ -1957,9 +2976,11 @@ class TestAppeal(TestCase):
         # specific error message (in this case we confirmed the original
         # decision).
         appeal_job.update(
-            decision_id='appeal decision id',
-            decision_action=CinderJob.DECISION_ACTIONS.AMO_APPROVE,
-            decision_date=datetime.now(),
+            decision=ContentDecision.objects.create(
+                cinder_id='appeal decision id',
+                action=DECISION_ACTIONS.AMO_APPROVE,
+                addon=self.addon,
+            )
         )
 
         response = self.client.get(self.reporter_appeal_url)
@@ -1987,8 +3008,10 @@ class TestAppeal(TestCase):
             reporter_email='otherreporter@example.com',
         )
         appeal_job = CinderJob.objects.create(job_id='appeal job id')
-        self.cinder_job.update(appeal_job=appeal_job)
-        other_abuse_report.update(appellant_job=appeal_job)
+        self.cinder_job.decision.update(appeal_job=appeal_job)
+        CinderAppeal.objects.create(
+            decision=self.cinder_job.decision, reporter_report=other_abuse_report
+        )
 
         self.client.force_login(user)
         response = self.client.get(self.reporter_appeal_url)
@@ -2004,9 +3027,11 @@ class TestAppeal(TestCase):
         # the content is already supposed to be disabled but the reporter might
         # not have noticed).
         appeal_job.update(
-            decision_id='appeal decision id',
-            decision_action=CinderJob.DECISION_ACTIONS.AMO_DISABLE_ADDON,
-            decision_date=datetime.now(),
+            decision=ContentDecision.objects.create(
+                cinder_id='appeal decision id',
+                action=DECISION_ACTIONS.AMO_DISABLE_ADDON,
+                addon=self.addon,
+            )
         )
 
         response = self.client.get(self.reporter_appeal_url)
@@ -2021,13 +3046,77 @@ class TestAppeal(TestCase):
             'and have reversed our prior decision'
         ) in doc.text()
 
+    def test_reporter_cant_appeal_overridden_decision(self):
+        user = user_factory()
+        self.abuse_report.update(reporter=user)
+
+        self.client.force_login(user)
+        response = self.client.get(self.reporter_appeal_url)
+        assert response.status_code == 200
+        doc = pq(response.content)
+        assert doc('#id_reason')
+        assert not doc('#appeal-thank-you')
+        assert doc('#appeal-submit')
+
+        ContentDecision.objects.create(
+            cinder_id='appeal decision id',
+            action=DECISION_ACTIONS.AMO_APPROVE,
+            addon=self.addon,
+            override_of=self.cinder_job.decision,
+        )
+
+        response = self.client.get(self.reporter_appeal_url)
+        assert response.status_code == 200
+        doc = pq(response.content)
+        assert not doc('#id_reason')
+        assert not doc('#appeal-thank-you')
+        assert not doc('#appeal-submit')
+        assert (
+            'The decision you are appealing has already been overridden by a new '
+            'decision' in doc.text()
+        )
+
+    def test_author_cant_appeal_overridden_decision(self):
+        self.cinder_job.decision.update(action=DECISION_ACTIONS.AMO_DISABLE_ADDON)
+        user = user_factory()
+        self.addon.authors.add(user)
+        self.client.force_login(user)
+        response = self.client.get(self.author_appeal_url)
+
+        assert response.status_code == 200
+        doc = pq(response.content)
+        assert doc('#id_reason')
+        assert not doc('#appeal-thank-you')
+        assert doc('#appeal-submit')
+
+        ContentDecision.objects.create(
+            cinder_id='appeal decision id',
+            action=DECISION_ACTIONS.AMO_APPROVE,
+            addon=self.addon,
+            override_of=self.cinder_job.decision,
+        )
+
+        response = self.client.get(self.author_appeal_url)
+        assert response.status_code == 200
+        doc = pq(response.content)
+        assert not doc('#id_reason')
+        assert not doc('#appeal-thank-you')
+        assert not doc('#appeal-submit')
+        assert (
+            'The decision you are appealing has already been overridden by a new '
+            'decision' in doc.text()
+        )
+
     def test_throttling_initial_email_form(self):
         expected_error_message = (
             'You have submitted this form too many times recently. '
             'Please try again after some time.'
         )
-        self.cinder_job.update(decision_action=CinderJob.DECISION_ACTIONS.AMO_BAN_USER)
-        self.abuse_report.update(guid=None, user=user_factory())
+        target = user_factory()
+        self.cinder_job.decision.update(
+            action=DECISION_ACTIONS.AMO_BAN_USER, addon=None, user=target
+        )
+        self.abuse_report.update(guid=None, user=target)
         with freeze_time() as frozen_time:
             for _x in range(0, 20):
                 self._add_fake_throttling_action(
@@ -2038,7 +3127,7 @@ class TestAppeal(TestCase):
                 )
             response = self.client.post(
                 self.author_appeal_url,
-                {'email': self.abuse_report.user.email},
+                {'email': target.email},
                 REMOTE_ADDR='5.6.7.8',
             )
             assert (
@@ -2061,7 +3150,7 @@ class TestAppeal(TestCase):
             frozen_time.tick(delta=timedelta(hours=24, seconds=1))
             response = self.client.post(
                 self.author_appeal_url,
-                {'email': self.abuse_report.user.email},
+                {'email': target.email},
                 REMOTE_ADDR='5.6.7.8',
             )
             assert (
@@ -2078,8 +3167,11 @@ class TestAppeal(TestCase):
             'You have submitted this form too many times recently. '
             'Please try again after some time.'
         )
-        self.cinder_job.update(decision_action=CinderJob.DECISION_ACTIONS.AMO_BAN_USER)
-        self.abuse_report.update(guid=None, user=user_factory())
+        target = user_factory()
+        self.cinder_job.decision.update(
+            action=DECISION_ACTIONS.AMO_BAN_USER, addon=None, user=target
+        )
+        self.abuse_report.update(guid=None, user=target)
         with freeze_time():
             for _x in range(0, 20):
                 self._add_fake_throttling_action(
@@ -2107,9 +3199,7 @@ class TestAppeal(TestCase):
             'You have submitted this form too many times recently. '
             'Please try again after some time.'
         )
-        self.cinder_job.update(
-            decision_action=CinderJob.DECISION_ACTIONS.AMO_DISABLE_ADDON
-        )
+        self.cinder_job.decision.update(action=DECISION_ACTIONS.AMO_DISABLE_ADDON)
         user = user_factory()
         self.addon.authors.add(user)
         self.client.force_login(user)

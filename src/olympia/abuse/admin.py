@@ -1,16 +1,26 @@
+import functools
+
 from django.contrib import admin
 from django.core.paginator import Paginator
 from django.db.models import Count
+from django.http import (
+    HttpResponseForbidden,
+    HttpResponseNotAllowed,
+    HttpResponseRedirect,
+)
 from django.template import loader
-from django.urls import reverse
+from django.urls import re_path, reverse
 from django.utils.html import format_html, format_html_join
 
+from olympia import amo
+from olympia.access import acl
 from olympia.addons.models import Addon, AddonApprovalsCounter
 from olympia.amo.admin import AMOModelAdmin, DateRangeFilter, FakeChoicesMixin
 from olympia.ratings.models import Rating
 from olympia.translations.utils import truncate_text
 
-from .models import AbuseReport, CinderPolicy
+from .models import AbuseReport, CinderPolicy, ContentDecision
+from .tasks import sync_cinder_policies
 
 
 class AbuseReportTypeFilter(admin.SimpleListFilter):
@@ -141,6 +151,8 @@ class AbuseReportAdmin(AMOModelAdmin):
         'report_entry_point',
         'addon_card',
         'location',
+        'illegal_category',
+        'illegal_subcategory',
     )
     fieldsets = (
         ('Abuse Report Core Information', {'fields': ('reason', 'message')}),
@@ -168,6 +180,8 @@ class AbuseReportAdmin(AMOModelAdmin):
                     'addon_install_source_url',
                     'report_entry_point',
                     'location',
+                    'illegal_category',
+                    'illegal_subcategory',
                 )
             },
         ),
@@ -357,27 +371,33 @@ class CinderPolicyAdmin(AMOModelAdmin):
     fields = (
         'id',
         'created',
+        'modified',
         'uuid',
         'parent',
         'name',
         'text',
+        'expose_in_reviewer_tools',
+        'present_in_cinder',
+        'default_cinder_action',
     )
     list_display = (
-        'id',
         'uuid',
         'parent',
         'name',
         'linked_review_reasons',
+        'expose_in_reviewer_tools',
+        'present_in_cinder',
+        'default_cinder_action',
         'text',
+    )
+    readonly_fields = tuple(
+        set(fields) - {'expose_in_reviewer_tools', 'default_cinder_action'}
     )
     ordering = ('parent__name', 'name')
     list_select_related = ('parent',)
     view_on_site = False
 
     def has_add_permission(self, request):
-        return False
-
-    def has_change_permission(self, request, obj=None):
         return False
 
     def has_delete_permission(self, request, obj=None):
@@ -401,6 +421,75 @@ class CinderPolicyAdmin(AMOModelAdmin):
     def get_queryset(self, request):
         return super().get_queryset(request).prefetch_related('reviewactionreason_set')
 
+    def get_urls(self):
+        def wrap(view):
+            def wrapper(*args, **kwargs):
+                return self.admin_site.admin_view(view)(*args, **kwargs)
+
+            return functools.update_wrapper(wrapper, view)
+
+        urlpatterns = super().get_urls()
+        custom_urlpatterns = [
+            re_path(
+                r'^sync_cinder_policies/$',
+                wrap(self.sync_cinder_policies),
+                name='abuse_sync_cinder_policies',
+            ),
+        ]
+        return custom_urlpatterns + urlpatterns
+
+    def sync_cinder_policies(self, request, extra_context=None):
+        if not acl.action_allowed_for(request.user, amo.permissions.ADMIN_ADVANCED):
+            return HttpResponseForbidden()
+
+        if request.method != 'POST':
+            return HttpResponseNotAllowed(['POST'])
+
+        sync_cinder_policies.delay()
+        self.message_user(request, 'Cinder policies sync task triggered.')
+        return HttpResponseRedirect(reverse('admin:abuse_cinderpolicy_changelist'))
+
+
+class ContentDecisionAdmin(AMOModelAdmin):
+    fields = (
+        'id',
+        'created',
+        'modified',
+        'addon',
+        'user',
+        'rating',
+        'collection',
+        'action',
+        'action_date',
+        'cinder_id',
+        'notes',
+        'policies',
+        'appeal_job',
+    )
+    list_display = (
+        'created',
+        'action',
+        'addon',
+        'user',
+        'rating',
+        'collection',
+    )
+    readonly_fields = fields
+    view_on_site = False
+
+    def has_add_permission(self, request):
+        # Adding new decisions through the admin is useless, so we prevent it.
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        # Decisions shouldn't be deleted - if they're wrong, they should be overridden.
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        # Decisions can't be changed - if they're wrong, they should be overridden.
+        return False
+
 
 admin.site.register(AbuseReport, AbuseReportAdmin)
 admin.site.register(CinderPolicy, CinderPolicyAdmin)
+admin.site.register(ContentDecision, ContentDecisionAdmin)

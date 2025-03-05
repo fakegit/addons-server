@@ -1,63 +1,39 @@
 import json
 import os
 from copy import deepcopy
+from unittest import mock
 
 from django.conf import settings
 
+import pytest
 from sentry_sdk.hub import Hub
 
 from olympia.core.sentry import get_sentry_release
 
 
-def test_sentry_release_config():
-    version_json = os.path.join(settings.ROOT, 'version.json')
-    original = None
-    sentry_client = Hub.current.client
-    current_release = sentry_client.options.get('release')
-    assert get_sentry_release() == current_release
+@mock.patch.dict(os.environ, {'REQUIRE_SENTRY_VERSION': 'True'})
+@mock.patch('olympia.core.sentry.get_version_json', return_value={})
+def test_sentry_release_nothing_provided_strict(mock_get_version_json):
+    pytest.raises(ValueError, get_sentry_release)
 
-    # There is a version.json that contains `version: origin/master`
-    # by default in the repository. We should ignore that and fetch
-    # the git commit.
-    assert len(get_sentry_release()) == 40
 
-    # Cleanup for tests
-    if os.path.exists(version_json):
-        with open(version_json) as fobj:
-            original = fobj.read()
+@mock.patch('olympia.core.sentry.get_version_json', return_value={})
+def test_sentry_release_nothing_provided_loose(mock_get_version_json):
+    assert get_sentry_release() is None
 
-        os.remove(version_json)
 
-    # by default, if no version.json exists it simply fetches a git-sha
-    assert len(get_sentry_release()) == 40
+@mock.patch('olympia.core.sentry.get_version_json')
+def test_sentry_release_version_provided(mock_get_version_json):
+    version = {'version': '2024.01.01'}
+    mock_get_version_json.return_value = version
+    assert get_sentry_release() == version['version']
 
-    # It fetches `version` from the version.json
-    with open(version_json, 'w') as fobj:
-        fobj.write(json.dumps({'version': '2018.07.19'}))
 
-    assert get_sentry_release() == '2018.07.19'
-
-    os.remove(version_json)
-
-    # Or tries to get the commit from version.json alternatively
-    with open(version_json, 'w') as fobj:
-        fobj.write(json.dumps({'commit': '1111111'}))
-
-    assert get_sentry_release() == '1111111'
-
-    if original:
-        with open(version_json, 'w') as fobj:
-            fobj.write(original)
-
-    # Usual state of things, version is empty but commit is set
-    with open(version_json, 'w') as fobj:
-        fobj.write(json.dumps({'version': '', 'commit': '1111111'}))
-
-    assert get_sentry_release() == '1111111'
-
-    if original:
-        with open(version_json, 'w') as fobj:
-            fobj.write(original)
+@mock.patch('olympia.core.sentry.get_version_json')
+def test_sentry_release_commit_provided(mock_get_version_json):
+    version = {'commit': 'abc'}
+    mock_get_version_json.return_value = version
+    assert get_sentry_release() == version['commit']
 
 
 def test_sentry_data_scrubbing():
@@ -121,9 +97,9 @@ def test_sentry_data_scrubbing():
     # Same for expected_frame_data.
     expected_frame_data['vars']['email'] = '*** redacted ***'
     expected_frame_data['vars']['some_dict']['email'] = '*** redacted ***'
-    expected_frame_data['vars']['some_dict']['second_level'][1][
-        'email'
-    ] = '*** redacted ***'
+    expected_frame_data['vars']['some_dict']['second_level'][1]['email'] = (
+        '*** redacted ***'
+    )
     assert (
         expected_frame_data
         == event['exception']['values'][0]['stacktrace']['frames'][3]
@@ -133,9 +109,9 @@ def test_sentry_data_scrubbing():
     assert len(event['breadcrumbs']['values']) == 8
 
     # We redacted the rest
-    expected_breadcrumb_data['data'][
-        'url'
-    ] = 'https://reputationservice.example.com/...redacted...'
+    expected_breadcrumb_data['data']['url'] = (
+        'https://reputationservice.example.com/...redacted...'
+    )
     assert expected_breadcrumb_data == event['breadcrumbs']['values'][5]
 
     # Sensitive stuff that should have been redacted.

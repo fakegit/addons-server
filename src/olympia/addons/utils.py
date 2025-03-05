@@ -1,4 +1,3 @@
-import re
 import uuid
 
 from django import forms
@@ -11,9 +10,8 @@ from django_statsd.clients import statsd
 
 from olympia import amo, core
 from olympia.access.acl import action_allowed_for
-from olympia.amo.utils import normalize_string
+from olympia.amo.utils import normalize_string, verify_condition_with_locales
 from olympia.discovery.utils import call_recommendation_server
-from olympia.translations.fields import LocaleErrorMessage
 from olympia.translations.models import Translation
 
 
@@ -24,7 +22,7 @@ def generate_addon_guid():
     return '{%s}' % str(uuid.uuid4())
 
 
-def verify_mozilla_trademark(name, user, form=None):
+def verify_mozilla_trademark(name, user, *, form=None):
     skip_trademark_check = (
         user
         and user.is_authenticated
@@ -42,27 +40,15 @@ def verify_mozilla_trademark(name, user, form=None):
             if violates_trademark:
                 raise forms.ValidationError(
                     gettext(
-                        'Add-on names cannot contain the Mozilla or '
-                        'Firefox trademarks.'
+                        'Add-on names cannot contain the Mozilla or Firefox trademarks.'
                     )
                 )
 
     if not skip_trademark_check:
-        if not isinstance(name, dict):
-            _check(name)
-        else:
-            for locale, localized_name in name.items():
-                try:
-                    _check(localized_name)
-                except forms.ValidationError as exc:
-                    if form is not None:
-                        for message in exc.messages:
-                            error_message = LocaleErrorMessage(
-                                message=message, locale=locale
-                            )
-                            form.add_error('name', error_message)
-                    else:
-                        raise
+        verify_condition_with_locales(
+            value=name, check_func=_check, form=form, field_name='name'
+        )
+
     return name
 
 
@@ -71,6 +57,7 @@ TAAR_LITE_FALLBACKS = [
     'treestyletab@piro.sakura.ne.jp',  # Tree Style Tab
     'languagetool-webextension@languagetool.org',  # LanguageTool
     '{2e5ff8c8-32fe-46d0-9fc8-6b8986621f3c}',  # Search by Image
+    'simple-tab-groups@drive4ik',  # Simple Tab Groups
 ]
 
 TAAR_LITE_OUTCOME_REAL_SUCCESS = 'recommended'
@@ -103,7 +90,7 @@ def get_addon_recommendations(guid_param, taar_enable):
     else:
         outcome = TAAR_LITE_OUTCOME_CURATED
     if not guids:
-        guids = TAAR_LITE_FALLBACKS
+        guids = get_filtered_fallbacks(guid_param)
     return guids, outcome, fail_reason
 
 
@@ -111,12 +98,19 @@ def is_outcome_recommended(outcome):
     return outcome == TAAR_LITE_OUTCOME_REAL_SUCCESS
 
 
-def get_addon_recommendations_invalid():
+def get_addon_recommendations_invalid(current_guid=None):
     return (
-        TAAR_LITE_FALLBACKS,
+        get_filtered_fallbacks(current_guid),
         TAAR_LITE_OUTCOME_REAL_FAIL,
         TAAR_LITE_FALLBACK_REASON_INVALID,
     )
+
+
+def get_filtered_fallbacks(current_guid=None):
+    # Filter out the current_guid from TAAR_LITE_FALLBACKS.
+    # A maximum of 4 should be returned at a time.
+    # See https://mozilla.github.io/addons-server/topics/api/addons.html#recommendations
+    return [guid for guid in TAAR_LITE_FALLBACKS if guid != current_guid][:4]
 
 
 def compute_last_updated(addon):
@@ -158,18 +152,6 @@ class DeleteTokenSigner(TimestampSigner):
             log.debug(exc)
             return False
         return token_payload['addon_id'] == addon_id
-
-
-def webext_version_stats(request, source):
-    log.info(f'webext_version_stats header: {request.META.get("HTTP_USER_AGENT")}')
-    webext_version_match = re.match(
-        r'web-ext/([\d\.]+)$', request.META.get('HTTP_USER_AGENT') or ''
-    )
-    if webext_version_match:
-        webext_version = webext_version_match[1].replace('.', '_')
-        log.info(f'webext_version_stats webext_version: {webext_version}')
-        statsd.incr(f'{source}.webext_version.{webext_version}')
-    log.info('webext_version_stats no match')
 
 
 def validate_version_number_is_gt_latest_signed_listed_version(addon, version_string):

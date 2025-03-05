@@ -21,7 +21,7 @@ from waffle.testutils import override_switch
 from olympia import amo, core
 from olympia.accounts.utils import fxa_login_url
 from olympia.activity.models import GENERIC_USER_NAME, ActivityLog
-from olympia.addons.models import Addon, AddonCategory, AddonReviewerFlags, AddonUser
+from olympia.addons.models import Addon, AddonCategory, AddonUser
 from olympia.amo.templatetags.jinja_helpers import (
     format_date,
     url as url_reverse,
@@ -36,11 +36,12 @@ from olympia.amo.tests import (
 from olympia.amo.tests.test_helpers import get_image_path
 from olympia.api.models import SYMMETRIC_JWT_TYPE, APIKey, APIKeyConfirmation
 from olympia.applications.models import AppVersion
-from olympia.constants.promoted import RECOMMENDED
+from olympia.constants.promoted import PROMOTED_GROUP_CHOICES
 from olympia.devhub.decorators import dev_required
+from olympia.devhub.forms import APIKeyForm
 from olympia.devhub.models import BlogPost
 from olympia.devhub.tasks import validate
-from olympia.devhub.views import VERIFY_EMAIL_STATE, get_next_version_number
+from olympia.devhub.views import get_next_version_number
 from olympia.files.models import FileUpload
 from olympia.files.tests.test_models import UploadMixin
 from olympia.ratings.models import Rating
@@ -185,9 +186,9 @@ class TestDashboard(HubTest):
         assert item.find('p.downloads'), 'Expected weekly downloads'
         assert item.find('p.users'), 'Expected ADU'
         assert item.find('.item-details'), 'Expected item details'
-        assert not item.find(
-            'p.incomplete'
-        ), 'Unexpected message about incomplete add-on'
+        assert not item.find('p.incomplete'), (
+            'Unexpected message about incomplete add-on'
+        )
 
         appver = self.addon.current_version.apps.all()[0]
         appver.delete()
@@ -535,7 +536,9 @@ class TestHome(TestCase):
         assert self.get_pq()('.DevHub-MyAddons-list .DevHub-MyAddons-item').length == 0
 
     def test_my_addons_recommended(self):
-        self.make_addon_promoted(self.addon, RECOMMENDED, approve_version=True)
+        self.make_addon_promoted(
+            self.addon, PROMOTED_GROUP_CHOICES.RECOMMENDED, approve_version=True
+        )
         latest_version = self.addon.find_latest_version(amo.CHANNEL_LISTED)
         latest_file = latest_version.file
         statuses = [
@@ -878,6 +881,7 @@ class TestDeveloperAgreement(TestCase):
         assert 'agreement_form' in response.context
 
 
+@override_switch('developer-submit-addon-captcha', active=True)
 class TestAPIKeyPage(TestCase):
     fixtures = ['base/addon_3615', 'base/users']
 
@@ -888,6 +892,12 @@ class TestAPIKeyPage(TestCase):
         self.user = UserProfile.objects.get(email='del@icio.us')
         self.user.update(last_login_ip='192.168.1.1')
         self.create_flag('2fa-enforcement-for-developers-and-special-users')
+
+    def _submit_actions(self, doc):
+        return doc('form[name=api-credentials-form] button[type=submit][name=action]')
+
+    def _inputs(self, doc):
+        return doc('form[name=api-credentials-form] input')
 
     def test_key_redirect(self):
         self.user.update(read_dev_agreement=None)
@@ -917,13 +927,13 @@ class TestAPIKeyPage(TestCase):
         response = self.client.get(self.url)
         assert response.status_code == 200
         doc = pq(response.content)
-        submit = doc('#generate-key')
-        assert submit.text() == 'Generate new credentials'
-        inputs = doc('.api-input input')
-        assert len(inputs) == 0, 'Inputs should be absent before keys exist'
-        assert not doc('input[name=confirmation_token]')
+        form = response.context['form']
+        assert 'recaptcha' in form.fields
+        (confirm_button,) = self._submit_actions(doc)
+        assert 'Confirm email address' in confirm_button.text
+        assert confirm_button.get('value') == APIKeyForm.ACTION_CHOICES.confirm
 
-    def test_view_with_credentials(self):
+    def test_view_with_credentials_not_confirmed_yet(self):
         APIKey.objects.create(
             user=self.user,
             type=SYMMETRIC_JWT_TYPE,
@@ -933,11 +943,38 @@ class TestAPIKeyPage(TestCase):
         response = self.client.get(self.url)
         assert response.status_code == 200
         doc = pq(response.content)
-        submit = doc('#generate-key')
-        assert submit.text() == 'Revoke and regenerate credentials'
-        assert doc('#revoke-key').text() == 'Revoke'
-        key_input = doc('.key-input input').val()
-        assert key_input == 'some-jwt-key'
+        form = response.context['form']
+        assert 'credentials_key' in form.fields
+        assert 'credentials_secret' in form.fields
+        (revoke_button,) = self._submit_actions(doc)
+
+        assert 'Revoke' in revoke_button.text
+        assert revoke_button.get('value') == APIKeyForm.ACTION_CHOICES.revoke
+
+    def test_view_with_credentials_confirmed(self):
+        APIKeyConfirmation.objects.create(
+            user=self.user, token='doesnt matter', confirmed_once=True
+        )
+        APIKey.objects.create(
+            user=self.user,
+            type=SYMMETRIC_JWT_TYPE,
+            key='some-jwt-key',
+            secret='some-jwt-secret',
+        )
+        response = self.client.get(self.url)
+        assert response.status_code == 200
+        doc = pq(response.content)
+        form = response.context['form']
+        assert 'credentials_key' in form.fields
+        assert 'credentials_secret' in form.fields
+
+        revoke_button, regenerate_button = self._submit_actions(doc)
+
+        assert 'Revoke' in revoke_button.text
+        assert revoke_button.get('value') == APIKeyForm.ACTION_CHOICES.revoke
+
+        assert 'Revoke and regenerate credentials' in regenerate_button.text
+        assert regenerate_button.get('value') == APIKeyForm.ACTION_CHOICES.regenerate
 
     def test_view_without_credentials_confirmation_requested_no_token(self):
         APIKeyConfirmation.objects.create(
@@ -946,11 +983,13 @@ class TestAPIKeyPage(TestCase):
         response = self.client.get(self.url)
         assert response.status_code == 200
         doc = pq(response.content)
-        # Since confirmation has already been requested, there shouldn't be
-        # any buttons on the page if no token was passed in the URL - the user
-        # needs to follow the link in the email to continue.
-        assert not doc('input[name=confirmation_token]')
-        assert not doc('input[name=action]')
+        form = response.context['form']
+        assert 'confirmation_token' in form.fields
+
+        _, confirmation_token = self._inputs(doc)
+        assert confirmation_token.get('value') is None
+
+        assert len(self._submit_actions(doc)) == 0
 
     def test_view_without_credentials_confirmation_requested_with_token(self):
         APIKeyConfirmation.objects.create(
@@ -960,28 +999,36 @@ class TestAPIKeyPage(TestCase):
         response = self.client.get(self.url)
         assert response.status_code == 200
         doc = pq(response.content)
-        assert len(doc('input[name=confirmation_token]')) == 1
-        token_input = doc('input[name=confirmation_token]')[0]
-        assert token_input.value == 'secrettoken'
-        submit = doc('#generate-key')
-        assert submit.text() == 'Confirm and generate new credentials'
+        form = response.context['form']
+        assert 'confirmation_token' in form.fields
+
+        _, confirmation_token = self._inputs(doc)
+        assert confirmation_token.value == 'secrettoken'
+
+        (generate_button,) = self._submit_actions(doc)
+        assert 'Generate new credentials' in generate_button.text
+        assert generate_button.get('value') == APIKeyForm.ACTION_CHOICES.generate
 
     def test_view_no_credentials_has_been_confirmed_once(self):
         APIKeyConfirmation.objects.create(
             user=self.user, token='doesnt matter', confirmed_once=True
         )
-        # Should look similar to when there are no credentials and no
-        # confirmation has been requested yet, the post action is where it
-        # will differ.
-        self.test_view_without_credentials_not_confirmed_yet()
+        response = self.client.get(self.url)
+        assert response.status_code == 200
+        doc = pq(response.content)
+        (confirm_button,) = self._submit_actions(doc)
+        assert 'Generate new credentials' in confirm_button.text
+        assert confirm_button.get('value') == APIKeyForm.ACTION_CHOICES.generate
 
     def test_create_new_credentials_has_been_confirmed_once(self):
         APIKeyConfirmation.objects.create(
             user=self.user, token='doesnt matter', confirmed_once=True
         )
-        patch = mock.patch('olympia.devhub.views.APIKey.new_jwt_credentials')
+        patch = mock.patch('olympia.devhub.forms.APIKey.new_jwt_credentials')
         with patch as mock_creator:
-            response = self.client.post(self.url, data={'action': 'generate'})
+            response = self.client.post(
+                self.url, data={'action': APIKeyForm.ACTION_CHOICES.generate}
+            )
         mock_creator.assert_called_with(self.user)
 
         assert len(mail.outbox) == 1
@@ -996,14 +1043,15 @@ class TestAPIKeyPage(TestCase):
         confirmation = APIKeyConfirmation.objects.create(
             user=self.user, token='secrettoken', confirmed_once=False
         )
-        patch = mock.patch('olympia.devhub.views.APIKey.new_jwt_credentials')
-        with patch as mock_creator:
-            response = self.client.post(
-                self.url,
-                data={'action': 'generate', 'confirmation_token': 'secrettoken'},
-            )
-        mock_creator.assert_called_with(self.user)
-
+        assert not APIKey.objects.filter(user=self.user).exists()
+        response = self.client.post(
+            self.url,
+            data={
+                'action': APIKeyForm.ACTION_CHOICES.generate,
+                'confirmation_token': 'secrettoken',
+            },
+        )
+        assert APIKey.objects.filter(user=self.user).exists()
         assert len(mail.outbox) == 1
         message = mail.outbox[0]
         assert message.to == [self.user.email]
@@ -1018,7 +1066,13 @@ class TestAPIKeyPage(TestCase):
     def test_create_new_credentials_not_confirmed_yet(self):
         assert not APIKey.objects.filter(user=self.user).exists()
         assert not APIKeyConfirmation.objects.filter(user=self.user).exists()
-        response = self.client.post(self.url, data={'action': 'generate'})
+        response = self.client.post(
+            self.url,
+            data={
+                'action': APIKeyForm.ACTION_CHOICES.confirm,
+                'g-recaptcha-response': 'test',
+            },
+        )
         self.assert3xx(response, self.url)
 
         # Since there was no credentials are no confirmation yet, this should
@@ -1043,27 +1097,36 @@ class TestAPIKeyPage(TestCase):
         confirmation = APIKeyConfirmation.objects.create(
             user=self.user, token='doesnt matter', confirmed_once=False
         )
-        response = self.client.post(self.url, data={'action': 'generate'})
+        response = self.client.post(
+            self.url, data={'action': APIKeyForm.ACTION_CHOICES.generate}
+        )
         assert len(mail.outbox) == 0
         assert not APIKey.objects.filter(user=self.user).exists()
         confirmation.reload()
         assert not confirmation.confirmed_once  # Unchanged
-        self.assert3xx(response, self.url)
+        form = response.context['form']
+        assert not form.is_valid()
+        assert '__all__' in form.errors
 
     def test_create_new_credentials_confirmation_exists_token_is_wrong(self):
         confirmation = APIKeyConfirmation.objects.create(
             user=self.user, token='sometoken', confirmed_once=False
         )
         response = self.client.post(
-            self.url, data={'action': 'generate', 'confirmation_token': 'wrong'}
+            self.url,
+            data={
+                'action': APIKeyForm.ACTION_CHOICES.generate,
+                'confirmation_token': 'wrong',
+            },
         )
-        # Nothing should have happened, the user will just be redirect to the
-        # page.
+        # Nothing should have happened, the user will just see the rendered form errors
         assert len(mail.outbox) == 0
         assert not APIKey.objects.filter(user=self.user).exists()
         confirmation.reload()
         assert not confirmation.confirmed_once
-        self.assert3xx(response, self.url)
+        form = response.context['form']
+        assert form.is_valid() is False
+        assert 'confirmation_token' in form.errors
 
     def test_delete_and_recreate_credentials_has_been_confirmed_once(self):
         APIKeyConfirmation.objects.create(
@@ -1075,7 +1138,9 @@ class TestAPIKeyPage(TestCase):
             key='some-jwt-key',
             secret='some-jwt-secret',
         )
-        response = self.client.post(self.url, data={'action': 'generate'})
+        response = self.client.post(
+            self.url, data={'action': APIKeyForm.ACTION_CHOICES.regenerate}
+        )
         self.assert3xx(response, self.url)
 
         old_key = APIKey.objects.get(pk=old_key.pk)
@@ -1092,31 +1157,34 @@ class TestAPIKeyPage(TestCase):
             key='some-jwt-key',
             secret='some-jwt-secret',
         )
-        response = self.client.post(self.url, data={'action': 'generate'})
+        response = self.client.post(
+            self.url, data={'action': APIKeyForm.ACTION_CHOICES.regenerate}
+        )
+        form = response.context['form']
+        assert not form.is_valid()
+        assert '__all__' in form.errors
+
+        # We cannot regenerate without a confirmation
+        assert old_key.reload().is_active
+
+        # Since there was no confirmation, the user can revoke the current key
+        # effectively starting from the beginning with recaptcha and confirmation.
+        response = self.client.post(
+            self.url, data={'action': APIKeyForm.ACTION_CHOICES.revoke}
+        )
         self.assert3xx(response, self.url)
-
-        old_key = APIKey.objects.get(pk=old_key.pk)
-        assert old_key.is_active is None
-
-        # Since there was no confirmation, this should create a one, send an
-        # email with the token, but not create credentials yet. (Would happen
-        # for an user that had api keys from before we introduced confirmation
-        # mechanism, but decided to regenerate).
-        assert len(mail.outbox) == 2  # 2 because of key revocation email.
+        assert len(mail.outbox) == 1
         assert 'revoked' in mail.outbox[0].body
-        message = mail.outbox[1]
+        message = mail.outbox[0]
         assert message.to == [self.user.email]
         assert not APIKey.objects.filter(user=self.user, is_active=True).exists()
-        assert APIKeyConfirmation.objects.filter(user=self.user).exists()
-        confirmation = APIKeyConfirmation.objects.filter(user=self.user).get()
-        assert confirmation.token
-        assert not confirmation.confirmed_once
-        token = confirmation.token
-        expected_url = (
-            f'http://testserver/en-US/developers/addon/api/key/?token={token}'
-        )
-        assert message.subject == 'Confirmation for developer API keys'
-        assert expected_url in message.body
+        assert not APIKeyConfirmation.objects.filter(user=self.user).exists()
+
+        # Now the user is at the beginning and can generate new credentials
+        response = self.client.get(self.url)
+        assert response.status_code == 200
+        form = response.context['form']
+        assert 'recaptcha' in form.fields
 
     def test_delete_credentials(self):
         old_key = APIKey.objects.create(
@@ -1125,7 +1193,9 @@ class TestAPIKeyPage(TestCase):
             key='some-jwt-key',
             secret='some-jwt-secret',
         )
-        response = self.client.post(self.url, data={'action': 'revoke'})
+        response = self.client.post(
+            self.url, data={'action': APIKeyForm.ACTION_CHOICES.revoke}
+        )
         self.assert3xx(response, self.url)
 
         old_key = APIKey.objects.get(pk=old_key.pk)
@@ -1147,6 +1217,28 @@ class TestAPIKeyPage(TestCase):
         )
         self.assert3xx(response, expected_location)
 
+    @override_switch('developer-submit-addon-captcha', active=False)
+    def test_recaptcha_is_disabled(self):
+        response = self.client.get(self.url)
+        form = response.context['form']
+        assert 'recaptcha' not in form.fields
+
+    def test_post_token_preferred_over_get_token(self):
+        APIKeyConfirmation.objects.create(
+            user=self.user, token='secrettoken', confirmed_once=False
+        )
+        response = self.client.post(
+            f'{self.url}?token=secrettoken',
+            data={
+                'action': APIKeyForm.ACTION_CHOICES.generate,
+                'confirmation_token': 'wrong',
+            },
+        )
+        form = response.context['form']
+        assert not form.is_valid()
+        assert 'confirmation_token' in form.errors
+        assert form.data.get('confirmation_token') == 'wrong'
+
 
 class TestUpload(UploadMixin, TestCase):
     fixtures = ['base/users']
@@ -1165,6 +1257,15 @@ class TestUpload(UploadMixin, TestCase):
             'theme_specific': 'True' if theme_specific else 'False',
         }
         return self.client.post(self.url, data, **kwargs)
+
+    def test_submissions_disabled(self):
+        self.create_flag('enable-submissions', note=':-(', everyone=False)
+        self.client.force_login_with_2fa(self.user)
+        response = self.post()
+        assert response.status_code == 503
+        doc = pq(response.content)
+        assert 'Add-on uploads are temporarily unavailable.' in doc.text()
+        assert ':-(' in doc.text()
 
     def test_login_required(self):
         self.client.logout()
@@ -1213,8 +1314,7 @@ class TestUpload(UploadMixin, TestCase):
         msg = validation['messages'][0]
         assert msg['type'] == 'error'
         assert msg['message'] == (
-            'Unsupported file type, please upload a supported file '
-            '(.crx, .xpi, .zip).'
+            'Unsupported file type, please upload a supported file (.crx, .xpi, .zip).'
         )
         assert not msg['description']
 
@@ -1370,7 +1470,7 @@ class TestUploadDetail(UploadMixin, TestCase):
 
     @classmethod
     def create_appversion(cls, application_name, version):
-        return AppVersion.objects.create(
+        return AppVersion.objects.get_or_create(
             application=amo.APPS[application_name].id, version=version
         )
 
@@ -1824,7 +1924,7 @@ class TestRequestReview(TestCase):
         # The author must upload a new version and re-nominate.
         # Renominating the same version resets the due date.
         mock_has_complete_metadata.return_value = True
-        AddonReviewerFlags.objects.create(addon=self.addon, auto_approval_disabled=True)
+        self.version.needshumanreview_set.create()
         orig_date = datetime.now() - timedelta(days=30)
         # Pretend it was due in the past:
         self.version.update(due_date=orig_date)
@@ -1833,9 +1933,9 @@ class TestRequestReview(TestCase):
         response = self.client.post(self.public_url)
         self.assert3xx(response, self.redirect_url)
         assert self.get_addon().status == amo.STATUS_NOMINATED
-        assert (
-            self.get_version().due_date.timetuple()[0:5] != (orig_date.timetuple()[0:5])
-        )
+        version = self.get_version()
+        assert version.due_date
+        assert version.due_date.timetuple()[0:5] != (orig_date.timetuple()[0:5])
 
 
 class TestRedirects(TestCase):
@@ -2192,270 +2292,208 @@ class TestVerifyEmail(TestCase):
         self.user_profile = user_factory()
         self.client.force_login(self.user_profile)
 
-    def _create_suppressed_email(self, user):
-        return SuppressedEmail.objects.create(email=user.email)
-
-    def _create_suppressed_email_verification(
-        self, user, suppressed_email=None, status=None
-    ):
-        if suppressed_email is None:
-            suppressed_email = self._create_suppressed_email(user)
-
-        if status is None:
-            status = SuppressedEmailVerification.STATUS_CHOICES.Pending
-
-        return SuppressedEmailVerification.objects.create(
-            suppressed_email=suppressed_email,
-            status=status,
+    def with_suppressed_email(self):
+        self.suppressed_email = SuppressedEmail.objects.create(
+            email=self.user_profile.email
         )
 
-    def _get(self, url=None):
-        url = self.url if url is None else url
-        return self.client.get(self.url)
-
-    def _post(self, url=None):
-        url = self.url if url is None else url
-        return self.client.post(self.url)
-
-    def _doc(self, content=None):
-        if content is None:
-            content = self._get().content
-        return pq(content)
-
-    def _set_url_code(self, code):
-        self.url += f'?code={code}'
-
-    def _assert_id_in_doc(self, doc, tag):
-        assert doc(f'#{tag}').length == 1, f'#{tag} not in {doc}'
-
-    def _assert_text_in_doc(self, doc, text):
-        assert text in doc.text(), f'"{text}" not in "{doc.text()}"'
-
-    def _assert_verify_button(self, doc, text):
-        print('text', doc("button[type='submit']").text())
-        assert text in doc("button[type='submit']").text()
-
-    def _assert_redirect_self(self, response, url=None):
-        url = self.url if url is None else url
-        self.assert3xx(response, url)
+    def with_email_verification(self):
+        self.with_suppressed_email()
+        self.email_verification = SuppressedEmailVerification.objects.create(
+            suppressed_email=self.suppressed_email
+        )
 
     @override_switch('suppressed-email', active=False)
-    def test_suppressed_email_waffle_disabled(self):
-        self._create_suppressed_email(self.user_profile)
+    def test_waffle_switch_disabled(self):
+        self.assert3xx(self.client.get(self.url), reverse('devhub.addons'))
 
-        assert self.user_profile.suppressed_email
+    @override_switch('suppressed-email', active=False)
+    def test_waffle_switch_disabled_suppressed_email(self):
+        self.with_suppressed_email()
 
-        response = self._get()
+        self.assert3xx(self.client.get(self.url), reverse('devhub.addons'))
 
-        self.assert3xx(response, reverse('devhub.addons'))
+    @override_switch('suppressed-email', active=False)
+    def test_waffle_switch_disabled_email_verification(self):
+        self.with_email_verification()
 
-    def test_hide_suppressed_email_snippet(self):
+        self.assert3xx(self.client.get(self.url), reverse('devhub.addons'))
+
+    @mock.patch('olympia.devhub.views.send_suppressed_email_confirmation')
+    def test_post_existing_verification(self, send_suppressed_email_confirmation_mock):
+        self.with_email_verification()
+        send_suppressed_email_confirmation_mock.delay.return_value = None
+        old_verification = self.email_verification
+        response = self.client.post(self.url)
+
+        self.assert3xx(response, reverse('devhub.email_verification'))
+        assert self.user_profile.reload().email_verification
+        assert not SuppressedEmailVerification.objects.filter(
+            pk=old_verification.pk
+        ).exists()
+
+    @mock.patch('olympia.devhub.views.send_suppressed_email_confirmation')
+    def test_post_new_verification(self, send_suppressed_email_confirmation_mock):
+        self.with_suppressed_email()
+        send_suppressed_email_confirmation_mock.delay.return_value = None
+        response = self.client.post(self.url)
+
+        self.assert3xx(response, reverse('devhub.email_verification'))
+        assert self.user_profile.reload().email_verification
+
+    def test_post_already_verified(self):
+        response = self.client.post(self.url)
+
+        self.assert3xx(response, reverse('devhub.email_verification'))
+        assert not self.user_profile.reload().suppressed_email
+
+    def test_get_hide_suppressed_email_snippet(self):
         """
         on verification page, do not show the suppressed email snippet
         """
-        doc = self._doc()
+        response = self.client.get(self.url)
+        doc = pq(response.content)
         assert doc('#suppressed-email').length == 0
 
-    def test_email_verified(self):
-        assert not self.user_profile.suppressed_email
+    @mock.patch('olympia.devhub.views.check_suppressed_email_confirmation')
+    def test_get_confirmation_complete(self, mock_check_emails):
+        mock_check_emails.return_value = []
+        self.with_email_verification()
+        code = self.email_verification.confirmation_code
+        url = f'{self.url}?code={code}'
 
-        doc = self._doc()
-        self._assert_text_in_doc(doc, 'Your email address is verified.')
-        self._assert_id_in_doc(doc, VERIFY_EMAIL_STATE['email_verified'])
+        assert not self.email_verification.is_expired
 
-    def test_email_suppressed(self):
-        """
-        current user has a suppressed email and no verification.
-        """
-        self._create_suppressed_email(self.user_profile)
-        assert not self.user_profile.email_verification
-
-        doc = self._doc()
-        self._assert_text_in_doc(doc, 'Please verify your email')
-        self._assert_verify_button(doc, 'Verify email')
-        self._assert_id_in_doc(doc, VERIFY_EMAIL_STATE['email_suppressed'])
-
-    @mock.patch('olympia.devhub.views.send_suppressed_email_confirmation')
-    def test_create_verification(self, send_suppressed_email_confirmation_mock):
-        """
-        post request to create verification
-        """
-        send_suppressed_email_confirmation_mock.delay.return_value = None
-        self._create_suppressed_email(self.user_profile)
-        assert not self.user_profile.email_verification
-
-        response = self._post()
-        self._assert_redirect_self(response)
-
-        assert self.user_profile.reload().email_verification
-        assert send_suppressed_email_confirmation_mock.delay.call_count == 1
-
-    @mock.patch('olympia.devhub.views.send_suppressed_email_confirmation')
-    def test_create_verification_existing(
-        self, send_suppressed_email_confirmation_mock
-    ):
-        """
-        post request to create verification when one already exists
-        will delete the existing one and create a new one
-        """
-        send_suppressed_email_confirmation_mock.delay.return_value = None
-        verification = self._create_suppressed_email_verification(self.user_profile)
-
-        assert self.user_profile.email_verification
-
-        response = self._post()
-        self._assert_redirect_self(response)
-
-        assert self.user_profile.reload().email_verification
-
-        assert not SuppressedEmailVerification.objects.filter(
-            pk=verification.pk
-        ).exists()
-
-    def test_create_verification_not_suppressed(self):
-        """
-        post request to create verification when email is not suppressed
-        """
-        assert not self.user_profile.suppressed_email
-        assert not self.user_profile.email_verification
-
-        response = self._post()
-        self._assert_redirect_self(response)
-
-    def test_verification_expired(self):
-        """
-        user has a verification that is expired, regardless of status.
-        """
-        verification = self._create_suppressed_email_verification(
-            self.user_profile, None
-        )
-
-        with freezegun.freeze_time(verification.created) as frozen_time:
-            frozen_time.tick(timedelta(days=31))
-
-            assert verification.is_expired
-
-            doc = self._doc()
-
-            self._assert_text_in_doc(
-                doc,
-                (
-                    'Could not verify email address. '
-                    'The verification link has expired.'
-                ),
-            )
-            self._assert_verify_button(doc, 'Try again')
-            self._assert_id_in_doc(doc, VERIFY_EMAIL_STATE['verification_expired'])
-
-    def test_verification_pending(self):
-        """
-        current user has a verification in `Pending`. waiting for email to be sent
-        """
-        self._create_suppressed_email_verification(self.user_profile)
-        assert self.user_profile.email_verification
-
-        doc = self._doc()
-        self._assert_text_in_doc(doc, 'Working... Please be patient.')
-        assert doc('.loader').length == 1
-        self._assert_id_in_doc(doc, VERIFY_EMAIL_STATE['verification_pending'])
-
-    def test_verification_timedout(self):
-        """
-        current user has a verification in `Pending`.
-        timeout exceeded so we show static message
-        """
-        verification = self._create_suppressed_email_verification(self.user_profile)
-        assert self.user_profile.email_verification
-
-        with freezegun.freeze_time(verification.created) as frozen_time:
-            frozen_time.tick(timedelta(seconds=31))
-
-            doc = self._doc()
-            self._assert_text_in_doc(doc, 'This is taking longer than expected.')
-            self._assert_id_in_doc(doc, VERIFY_EMAIL_STATE['verification_timedout'])
-            self._assert_verify_button(doc, 'Try again')
-
-    def test_verification_failed(self):
-        """
-        current user has a verification in `Failed`.
-        """
-        self._create_suppressed_email_verification(
-            self.user_profile,
-            None,
-            SuppressedEmailVerification.STATUS_CHOICES.Failed,
-        )
-        assert self.user_profile.email_verification
-
-        doc = self._doc()
-        self._assert_text_in_doc(doc, 'Failed to send confirmation email. ')
-        self._assert_verify_button(doc, 'Try again')
-        self._assert_id_in_doc(doc, VERIFY_EMAIL_STATE['verification_failed'])
-
-    def test_confirmation_pending(self):
-        """
-        current user has a verification in `Delivered`.
-        waiting for confirmation link to be clicked
-        """
-        self._create_suppressed_email_verification(
-            self.user_profile,
-            None,
-            SuppressedEmailVerification.STATUS_CHOICES.Delivered,
-        )
-        assert self.user_profile.email_verification
-
-        doc = self._doc()
-        self._assert_text_in_doc(doc, 'An email with a confirmation link has been sent')
-        self._assert_id_in_doc(doc, 'confirmation_pending')
-
-    def test_confirmation_link_invalid_code(self):
-        self._create_suppressed_email_verification(
-            self.user_profile,
-            None,
-            SuppressedEmailVerification.STATUS_CHOICES.Delivered,
-        )
-        self._set_url_code('invalid')
-
-        response = self._get()
-        self._assert_redirect_self(response, reverse('devhub.email_verification'))
-
-    def test_confirmation_link_unauthorized_code(self):
-        """
-        given code matches a verification that does not belong to the user.
-        """
-        self._create_suppressed_email_verification(
-            self.user_profile,
-            None,
-            SuppressedEmailVerification.STATUS_CHOICES.Delivered,
-        )
-        verification = self._create_suppressed_email_verification(
-            user_factory(), None, SuppressedEmailVerification.STATUS_CHOICES.Delivered
-        )
-
-        self._set_url_code(verification.confirmation_code)
-
-        doc = self._doc()
-        self._assert_text_in_doc(
-            doc, "The provided code is associated with another user's email"
-        )
-        self._assert_id_in_doc(doc, 'confirmation_unauthorized')
-        self._assert_verify_button(doc, 'Try again')
-
-    def test_confirmation_link_valid_code(self):
-        """
-        given code is valid and belongs to the user. remove the email suppression
-        """
-        verification = self._create_suppressed_email_verification(
-            self.user_profile,
-            None,
-            SuppressedEmailVerification.STATUS_CHOICES.Delivered,
-        )
-        self._set_url_code(verification.confirmation_code)
-
-        assert not verification.is_expired
-
-        response = self._get()
+        response = self.client.get(url)
 
         assert len(mail.outbox) == 1
         assert 'Your email was successfully verified.' in mail.outbox[0].body
-        expected_redirect = reverse('devhub.email_verification')
-        self.assert3xx(response, expected_redirect)
+        self.assert3xx(response, reverse('devhub.email_verification'))
+
+    @mock.patch('olympia.devhub.views.check_suppressed_email_confirmation')
+    def test_get_confirmation_complete_with_timeout(self, mock_check_emails):
+        mock_check_emails.return_value = []
+        self.with_email_verification()
+        code = self.email_verification.confirmation_code
+        url = f'{self.url}?code={code}'
+
+        assert not self.email_verification.is_expired
+        assert not self.email_verification.is_timedout
+
+        with freezegun.freeze_time(self.email_verification.created) as frozen_time:
+            frozen_time.tick(timedelta(minutes=10, seconds=1))
+            response = self.client.get(url)
+
+            assert len(mail.outbox) == 1
+            assert 'Your email was successfully verified.' in mail.outbox[0].body
+            self.assert3xx(response, reverse('devhub.email_verification'))
+
+    def test_get_email_verified(self):
+        response = self.client.get(self.url)
+        doc = pq(response.content)
+
+        assert 'Your email address' in doc.text()
+
+    def test_get_email_suppressed(self):
+        self.with_suppressed_email()
+        response = self.client.get(self.url)
+        doc = pq(response.content)
+
+        assert 'Please verify your email' in doc.text()
+        assert 'Verify email' in doc.text()
+
+    @mock.patch('olympia.devhub.views.check_suppressed_email_confirmation')
+    def test_get_verification_expired(self, mock_check_emails):
+        mock_check_emails.return_value = []
+        self.with_email_verification()
+
+        with freezegun.freeze_time(self.email_verification.created) as frozen_time:
+            frozen_time.tick(timedelta(days=31))
+
+            self.client.force_login(self.user_profile)
+            response = self.client.get(self.url)
+            doc = pq(response.content)
+
+            assert 'Could not verify email address.' in doc.text()
+            assert 'Send another email' in doc.text()
+
+    @mock.patch('olympia.devhub.views.check_suppressed_email_confirmation')
+    def test_get_verification_pending_without_emails(self, mock_check_emails):
+        mock_check_emails.return_value = []
+        self.with_email_verification()
+        response = self.client.get(self.url)
+        doc = pq(response.content)
+
+        assert 'We are sending an email to you' in doc.text()
+        assert 'Refresh results' in doc.text()
+
+    @mock.patch('olympia.devhub.views.check_suppressed_email_confirmation')
+    def test_get_verification_pending_with_emails(self, mock_check_emails):
+        mock_check_emails.return_value = [
+            {'status': 'Delivered', 'subject': 'subject', 'from': 'from', 'to': 'to'}
+        ]
+        self.with_email_verification()
+        response = self.client.get(self.url)
+        doc = pq(response.content)
+
+        assert (
+            'The table below shows all emails we have attempted to send to you'
+        ) in doc.text()
+        assert 'Delivered' in doc.text()
+        assert 'subject' in doc.text()
+        assert 'from' in doc.text()
+        assert 'to' in doc.text()
+        assert 'Refresh results' in doc.text()
+
+    @mock.patch('olympia.devhub.views.check_suppressed_email_confirmation')
+    def test_get_verification_timedout(self, mock_check_emails):
+        mock_check_emails.return_value = []
+        self.with_email_verification()
+
+        with freezegun.freeze_time(self.email_verification.created) as frozen_time:
+            frozen_time.tick(timedelta(minutes=10, seconds=31))
+
+            assert self.email_verification.is_timedout
+
+            response = self.client.get(self.url)
+            doc = pq(response.content)
+
+            assert 'It is taking longer than expected' in doc.text()
+            assert 'Send another email' in doc.text()
+
+            assert 'If you encounter issues' in doc.text()
+            support_link = doc('a:contains("troubleshooting suggestions")')
+            assert (
+                '/documentation/publish/developer-accounts/#email-issues'
+                '?utm_source=addons.mozilla.org&utm_medium=referral'
+                '&utm_content=devhub' in support_link.attr('href')
+            )
+
+    @mock.patch('olympia.devhub.views.check_suppressed_email_confirmation')
+    def test_get_verification_delivered(self, mock_check_suppressed):
+        mock_check_suppressed.return_value = []
+        self.with_email_verification()
+        self.email_verification.status = (
+            SuppressedEmailVerification.STATUS_CHOICES.Delivered
+        )
+        self.email_verification.save()
+        response = self.client.get(self.url)
+        doc = pq(response.content)
+
+        assert 'An email with a confirmation link has been sent' in doc.text()
+        assert 'The table below shows all emails ' not in doc.text()
+
+    @mock.patch('olympia.devhub.views.check_suppressed_email_confirmation')
+    def test_get_confirmation_invalid(self, mock_check_emails):
+        mock_check_emails.return_value = []
+        self.with_email_verification()
+        code = 'invalid'
+        url = f'{self.url}?code={code}'
+        response = self.client.get(url)
+        doc = pq(response.content)
+
+        assert (
+            'The provided code is invalid, unauthorized, expired or incomplete.'
+            in doc.text()
+        )
+        assert 'Send another email' in doc.text()

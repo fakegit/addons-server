@@ -11,8 +11,6 @@ EMAIL_BACKEND = EMAIL_URL['EMAIL_BACKEND']
 EMAIL_HOST_USER = EMAIL_URL['EMAIL_HOST_USER']
 EMAIL_HOST_PASSWORD = EMAIL_URL['EMAIL_HOST_PASSWORD']
 
-ENV = env('ENV')
-
 API_THROTTLING = True
 
 DOMAIN = env('DOMAIN', default='addons.allizom.org')
@@ -22,7 +20,6 @@ SITE_URL = 'https://' + DOMAIN
 INTERNAL_SITE_URL = env('INTERNAL_SITE_URL', default='https://addons.allizom.org')
 EXTERNAL_SITE_URL = env('EXTERNAL_SITE_URL', default='https://addons.allizom.org')
 SERVICES_URL = 'https://' + SERVICES_DOMAIN
-CODE_MANAGER_URL = env('CODE_MANAGER_URL', default='https://code.addons.allizom.org')
 STATIC_URL = '%s/static-server/' % EXTERNAL_SITE_URL
 MEDIA_URL = '%s/user-media/' % EXTERNAL_SITE_URL
 
@@ -70,14 +67,11 @@ TAAR_LITE_RECOMMENDATION_ENGINE_URL = env(
     default=('https://taarlite.prod.mozaws.net/taarlite/api/v1/addon_recommendations/'),
 )
 
-EXTENSION_WORKSHOP_URL = env(
-    'EXTENSION_WORKSHOP_URL', default='https://extensionworkshop.allizom.org'
-)
-
 REMOTE_SETTINGS_API_URL = 'https://firefox.settings.services.allizom.org/v1/'
 REMOTE_SETTINGS_WRITER_URL = env(
     'REMOTE_SETTINGS_WRITER_URL', default='https://remote-settings.allizom.org/v1/'
 )
-REMOTE_SETTINGS_WRITER_BUCKET = 'staging'
 
 CINDER_QUEUE_PREFIX = 'amo-stage-'
+
+ENABLE_ADMIN_MLBF_UPLOAD = True

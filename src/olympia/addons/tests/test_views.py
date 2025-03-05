@@ -49,12 +49,7 @@ from olympia.constants.browsers import CHROME
 from olympia.constants.categories import CATEGORIES, CATEGORIES_BY_ID
 from olympia.constants.licenses import LICENSE_GPL3
 from olympia.constants.promoted import (
-    LINE,
-    RECOMMENDED,
-    SPONSORED,
-    SPOTLIGHT,
-    STRATEGIC,
-    VERIFIED,
+    PROMOTED_GROUP_CHOICES,
 )
 from olympia.files.tests.test_models import UploadMixin
 from olympia.files.utils import parse_addon, parse_xpi
@@ -69,6 +64,7 @@ from olympia.versions.models import (
     AppVersion,
     License,
     VersionPreview,
+    VersionProvenance,
     VersionReviewerFlags,
 )
 
@@ -760,7 +756,7 @@ class TestAddonViewSetDetail(AddonAndVersionViewSetDetailMixin, TestCase):
 class RequestMixin:
     client_request_verb = None
 
-    def request(self, *, data=None, format=None, **kwargs):
+    def request(self, *, data=None, format=None, user_agent='web-ext/12.34', **kwargs):
         verb = getattr(self.client, self.client_request_verb, None)
         if not verb:
             raise NotImplementedError
@@ -768,7 +764,7 @@ class RequestMixin:
             self.url,
             data={**getattr(self, 'minimal_data', {}), **(data or kwargs)},
             format=format,
-            HTTP_USER_AGENT='web-ext/12.34',
+            HTTP_USER_AGENT=user_agent,
         )
 
 
@@ -884,7 +880,6 @@ class TestAddonViewSetCreate(UploadMixin, AddonViewSetCreateUpdateMixin, TestCas
     def setUpTestData(cls):
         versions = {
             amo.DEFAULT_WEBEXT_MIN_VERSION,
-            amo.DEFAULT_WEBEXT_MIN_VERSION_NO_ID,
             amo.DEFAULT_WEBEXT_MIN_VERSION_ANDROID,
             amo.DEFAULT_STATIC_THEME_MIN_VERSION_FIREFOX,
             amo.DEFAULT_WEBEXT_DICT_MIN_VERSION_FIREFOX,
@@ -946,6 +941,23 @@ class TestAddonViewSetCreate(UploadMixin, AddonViewSetCreateUpdateMixin, TestCas
         )
         self.statsd_incr_mock.assert_any_call('addons.submission.addon.unlisted')
         self.statsd_incr_mock.assert_any_call('addons.submission.webext_version.12_34')
+        provenance = VersionProvenance.objects.get()
+        assert provenance.version == expected_version
+        assert provenance.source == amo.UPLOAD_SOURCE_ADDON_API
+        assert provenance.client_info == 'web-ext/12.34'
+
+    def test_submissions_disabled(self):
+        self.create_flag('enable-submissions', note=':-(', everyone=False)
+        expected = {
+            'error': 'Add-on uploads are temporarily unavailable.',
+            'reason': ':-(',
+        }
+        response = self.request()
+        assert response.status_code == 503
+        assert response.json() == expected
+        self.create_flag('enable-submissions', note=':-(', users=[self.user.id])
+        response = self.request()
+        assert response.status_code != 503
 
     def test_invalid_upload(self):
         self.upload.update(valid=False)
@@ -1012,6 +1024,30 @@ class TestAddonViewSetCreate(UploadMixin, AddonViewSetCreateUpdateMixin, TestCas
         )
         self.statsd_incr_mock.assert_any_call('addons.submission.addon.listed')
         self.statsd_incr_mock.assert_any_call('addons.submission.webext_version.12_34')
+        provenance = VersionProvenance.objects.get()
+        assert provenance.version == expected_version
+        assert provenance.source == amo.UPLOAD_SOURCE_ADDON_API
+        assert provenance.client_info == 'web-ext/12.34'
+
+    def test_no_client_info(self):
+        self.upload.update(channel=amo.CHANNEL_LISTED)
+        response = self.request(
+            data={
+                'categories': ['bookmarks'],
+                'version': {
+                    'upload': self.upload.uuid,
+                    'license': self.license.slug,
+                },
+            },
+            user_agent='',
+        )
+        assert response.status_code == 201, response.content
+        addon = Addon.objects.get()
+        expected_version = addon.find_latest_version(channel=None)
+        provenance = VersionProvenance.objects.get()
+        assert provenance.version == expected_version
+        assert provenance.source == amo.UPLOAD_SOURCE_ADDON_API
+        assert provenance.client_info == ''
 
     def test_listed_metadata_missing(self):
         self.upload.update(channel=amo.CHANNEL_LISTED)
@@ -1142,11 +1178,18 @@ class TestAddonViewSetCreate(UploadMixin, AddonViewSetCreateUpdateMixin, TestCas
 
     def test_too_many_categories(self):
         response = self.request(
-            data={'categories': ['appearance', 'download-management', 'shopping']},
+            data={
+                'categories': [
+                    'appearance',
+                    'download-management',
+                    'shopping',
+                    'games-entertainment',
+                ]
+            },
         )
         assert response.status_code == 400, response.content
         assert response.data == {
-            'categories': ['Maximum number of categories per application (2) exceeded']
+            'categories': ['Maximum number of categories per application (3) exceeded']
         }
         assert not Addon.objects.all()
 
@@ -1652,8 +1695,11 @@ class TestAddonViewSetCreate(UploadMixin, AddonViewSetCreateUpdateMixin, TestCas
         }
 
     def test_dictionary_compat(self):
-        def _parse_xpi_mock(pkg, addon, minimal, user):
-            return {**parse_xpi(pkg, addon, minimal, user), 'type': amo.ADDON_DICT}
+        def _parse_xpi_mock(pkg, *, addon, minimal, user, **kwargs):
+            return {
+                **parse_xpi(pkg, addon=addon, minimal=minimal, user=user),
+                'type': amo.ADDON_DICT,
+            }
 
         with patch('olympia.files.utils.parse_xpi', side_effect=_parse_xpi_mock):
             response = self.request(
@@ -1720,7 +1766,12 @@ class TestAddonViewSetCreate(UploadMixin, AddonViewSetCreateUpdateMixin, TestCas
         request_data = {
             'version': {
                 'upload': self.upload.uuid,
-                'compatibility': {'android': {'min': '48.0', 'max': '*'}},
+                'compatibility': {
+                    'android': {
+                        'min': amo.DEFAULT_WEBEXT_MIN_VERSION_ANDROID,
+                        'max': '*',
+                    }
+                },
             }
         }
         response = self.request(data=request_data)
@@ -1776,8 +1827,11 @@ class TestAddonViewSetCreatePut(TestAddonViewSetCreate):
         return super().test_compatibility_langpack()
 
     def test_guid_mismatch(self):
-        def parse_xpi_mock(pkg, addon, minimal, user):
-            return {**parse_xpi(pkg, addon, minimal, user), 'guid': '@something'}
+        def parse_xpi_mock(pkg, *, addon, minimal, user, **kwargs):
+            return {
+                **parse_xpi(pkg, addon=addon, minimal=minimal, user=user),
+                'guid': '@something',
+            }
 
         with patch('olympia.files.utils.parse_xpi', side_effect=parse_xpi_mock):
             response = self.request()
@@ -1789,8 +1843,11 @@ class TestAddonViewSetCreatePut(TestAddonViewSetCreate):
         }
 
     def test_no_guid_in_manifest(self):
-        def parse_xpi_mock(pkg, addon, minimal, user):
-            return {**parse_xpi(pkg, addon, minimal, user), 'guid': None}
+        def parse_xpi_mock(pkg, *, addon, minimal, user, **kwargs):
+            return {
+                **parse_xpi(pkg, addon=addon, minimal=minimal, user=user),
+                'guid': None,
+            }
 
         with patch('olympia.files.utils.parse_xpi', side_effect=parse_xpi_mock):
             response = self.request()
@@ -1948,11 +2005,11 @@ class TestAddonViewSetUpdate(AddonViewSetCreateUpdateMixin, TestCase):
 
         # add description in other locale
         desc_es = 'descripción en español'
-        response = patch({'es': desc_es})
+        response = patch({'es-ES': desc_es})
         assert response.status_code == 200, response.content
-        assert response.data['description'] == {'en-US': desc_en_us, 'es': desc_es}
+        assert response.data['description'] == {'en-US': desc_en_us, 'es-ES': desc_es}
         assert self.addon.reload().description == desc_en_us
-        with self.activate('es'):
+        with self.activate('es-ES'):
             assert self.addon.reload().description == desc_es
         with self.activate('fr'):
             assert self.addon.reload().description == desc_en_us  # default fallback
@@ -1960,11 +2017,11 @@ class TestAddonViewSetUpdate(AddonViewSetCreateUpdateMixin, TestCase):
 
         # delete description in other locale (and add one)
         desc_fr = 'descriptif en français'
-        response = patch({'es': None, 'fr': desc_fr})
+        response = patch({'es-ES': None, 'fr': desc_fr})
         assert response.status_code == 200, response.content
         assert response.data['description'] == {'en-US': desc_en_us, 'fr': desc_fr}
         assert self.addon.reload().description == desc_en_us
-        with self.activate('es'):
+        with self.activate('es-ES'):
             assert self.addon.reload().description == desc_en_us  # default fallback
         with self.activate('fr'):
             assert self.addon.reload().description == desc_fr
@@ -2591,7 +2648,7 @@ class TestAddonViewSetUpdatePut(UploadMixin, TestAddonViewSetUpdate):
         version_data = super().test_basic()['latest_unlisted_version']
         assert version_data['license'] is None
         assert version_data['compatibility'] == {
-            'firefox': {'max': '*', 'min': '42.0'},
+            'firefox': {'max': '*', 'min': amo.DEFAULT_WEBEXT_MIN_VERSION},
         }
         assert self.addon.versions.count() == 2
         version = self.addon.find_latest_version(channel=None)
@@ -2610,7 +2667,7 @@ class TestAddonViewSetUpdatePut(UploadMixin, TestAddonViewSetUpdate):
             license
         )
         assert version_data['compatibility'] == {
-            'firefox': {'max': '*', 'min': '42.0'},
+            'firefox': {'max': '*', 'min': amo.DEFAULT_WEBEXT_MIN_VERSION},
         }
         assert self.addon.versions.count() == 2
         version = self.addon.find_latest_version(channel=None)
@@ -2966,7 +3023,7 @@ class TestVersionViewSetDetail(AddonAndVersionViewSetDetailMixin, TestCase):
         # not logged in
         assert 'source' not in self.client.get(self.url).data
 
-        user = UserProfile.objects.create(username='user')
+        user = user_factory()
         self.client.login_api(user)
 
         # logged in but not an author
@@ -3239,7 +3296,7 @@ class VersionViewSetCreateUpdateMixin(RequestMixin):
         version = self.addon.find_latest_version(channel=None)
         assert data['compatibility'] == {
             'android': {'max': '*', 'min': amo.MIN_VERSION_FENIX_GENERAL_AVAILABILITY},
-            'firefox': {'max': '*', 'min': '42.0'},
+            'firefox': {'max': '*', 'min': amo.DEFAULT_WEBEXT_MIN_VERSION},
         }
         assert list(version.compatible_apps.keys()) == [amo.FIREFOX, amo.ANDROID]
         for avs in version.compatible_apps.values():
@@ -3310,7 +3367,11 @@ class VersionViewSetCreateUpdateMixin(RequestMixin):
         assert response.data == {'compatibility': ['Unknown min app version specified']}
 
     def test_compatibility_forbidden_range_android(self):
-        response = self.request(compatibility={'android': {'min': '48.0', 'max': '*'}})
+        response = self.request(
+            compatibility={
+                'android': {'min': amo.DEFAULT_WEBEXT_MIN_VERSION_ANDROID, 'max': '*'}
+            }
+        )
         assert response.status_code == 400, response.content
         assert response.data == {
             'compatibility': [
@@ -3321,12 +3382,20 @@ class VersionViewSetCreateUpdateMixin(RequestMixin):
         }
 
         # Recommended add-ons for Android don't have that restriction.
-        self.make_addon_promoted(self.addon, RECOMMENDED, approve_version=True)
-        response = self.request(compatibility={'android': {'min': '48.0', 'max': '*'}})
+        self.make_addon_promoted(
+            self.addon, PROMOTED_GROUP_CHOICES.RECOMMENDED, approve_version=True
+        )
+        response = self.request(
+            compatibility={
+                'android': {'min': amo.DEFAULT_WEBEXT_MIN_VERSION_ANDROID, 'max': '*'}
+            }
+        )
         assert response.status_code == self.SUCCESS_STATUS_CODE, response.content
 
     def test_compatibility_forbidden_range_android_only_min_specified(self):
-        response = self.request(compatibility={'android': {'min': '48.0'}})
+        response = self.request(
+            compatibility={'android': {'min': amo.DEFAULT_WEBEXT_MIN_VERSION_ANDROID}}
+        )
         assert response.status_code == 400, response.content
         assert response.data == {
             'compatibility': [
@@ -3337,13 +3406,20 @@ class VersionViewSetCreateUpdateMixin(RequestMixin):
         }
 
         # Recommended add-ons for Android don't have that restriction.
-        self.make_addon_promoted(self.addon, RECOMMENDED, approve_version=True)
-        response = self.request(compatibility={'android': {'min': '48.0'}})
+        self.make_addon_promoted(
+            self.addon, PROMOTED_GROUP_CHOICES.RECOMMENDED, approve_version=True
+        )
+        response = self.request(
+            compatibility={'android': {'min': amo.DEFAULT_WEBEXT_MIN_VERSION_ANDROID}}
+        )
         assert response.status_code == self.SUCCESS_STATUS_CODE, response.content
 
     @staticmethod
-    def _parse_xpi_mock(pkg, addon, minimal, user):
-        return {**parse_xpi(pkg, addon, minimal, user), 'type': addon.type}
+    def _parse_xpi_mock(pkg, *, addon, minimal, user, **kwargs):
+        return {
+            **parse_xpi(pkg, addon=addon, minimal=minimal, user=user),
+            'type': addon.type,
+        }
 
     def test_compatibility_dictionary_list(self):
         self.addon.update(type=amo.ADDON_DICT)
@@ -3413,7 +3489,6 @@ class TestVersionViewSetCreate(UploadMixin, VersionViewSetCreateUpdateMixin, Tes
     def setUpTestData(cls):
         versions = {
             amo.DEFAULT_WEBEXT_MIN_VERSION,
-            amo.DEFAULT_WEBEXT_MIN_VERSION_NO_ID,
             amo.DEFAULT_WEBEXT_MIN_VERSION_ANDROID,
             amo.DEFAULT_STATIC_THEME_MIN_VERSION_FIREFOX,
             amo.DEFAULT_WEBEXT_DICT_MIN_VERSION_FIREFOX,
@@ -3455,6 +3530,19 @@ class TestVersionViewSetCreate(UploadMixin, VersionViewSetCreateUpdateMixin, Tes
         self.minimal_data = {'upload': self.upload.uuid}
         self.statsd_incr_mock = self.patch('olympia.addons.serializers.statsd.incr')
 
+    def test_submissions_disabled(self):
+        self.create_flag('enable-submissions', note=':-(', everyone=False)
+        expected = {
+            'error': 'Add-on uploads are temporarily unavailable.',
+            'reason': ':-(',
+        }
+        response = self.request()
+        assert response.status_code == 503
+        assert response.json() == expected
+        self.create_flag('enable-submissions', note=':-(', users=[self.user.id])
+        response = self.request()
+        assert response.status_code != 503
+
     def test_basic_unlisted(self):
         response = self.client.post(
             self.url,
@@ -3465,7 +3553,7 @@ class TestVersionViewSetCreate(UploadMixin, VersionViewSetCreateUpdateMixin, Tes
         data = response.data
         assert data['license'] is None
         assert data['compatibility'] == {
-            'firefox': {'max': '*', 'min': '42.0'},
+            'firefox': {'max': '*', 'min': amo.DEFAULT_WEBEXT_MIN_VERSION},
         }
         self.addon.reload()
         assert self.addon.versions.count() == 2
@@ -3479,6 +3567,10 @@ class TestVersionViewSetCreate(UploadMixin, VersionViewSetCreateUpdateMixin, Tes
         assert version.channel == amo.CHANNEL_UNLISTED
         self.statsd_incr_mock.assert_any_call('addons.submission.version.unlisted')
         self.statsd_incr_mock.assert_any_call('addons.submission.webext_version.12_34')
+        provenance = VersionProvenance.objects.get()
+        assert provenance.version == version
+        assert provenance.source == amo.UPLOAD_SOURCE_ADDON_API
+        assert provenance.client_info == 'web-ext/12.34'
 
     @mock.patch('olympia.addons.views.log')
     def test_does_not_log_without_source(self, log_mock):
@@ -3515,6 +3607,10 @@ class TestVersionViewSetCreate(UploadMixin, VersionViewSetCreateUpdateMixin, Tes
         assert self.addon.status == amo.STATUS_NOMINATED
         self.statsd_incr_mock.assert_any_call('addons.submission.version.listed')
         self.statsd_incr_mock.assert_any_call('addons.submission.webext_version.12_34')
+        provenance = VersionProvenance.objects.get()
+        assert provenance.version == version
+        assert provenance.source == amo.UPLOAD_SOURCE_ADDON_API
+        assert provenance.client_info == 'web-ext/12.34'
 
     def test_not_authenticated(self):
         self.client.logout_api()
@@ -3867,7 +3963,6 @@ class TestVersionViewSetUpdate(UploadMixin, VersionViewSetCreateUpdateMixin, Tes
     def setUpTestData(cls):
         versions = {
             amo.DEFAULT_WEBEXT_MIN_VERSION,
-            amo.DEFAULT_WEBEXT_MIN_VERSION_NO_ID,
             amo.DEFAULT_WEBEXT_MIN_VERSION_ANDROID,
             amo.DEFAULT_STATIC_THEME_MIN_VERSION_FIREFOX,
             amo.DEFAULT_WEBEXT_DICT_MIN_VERSION_FIREFOX,
@@ -4405,7 +4500,9 @@ class TestVersionViewSetUpdate(UploadMixin, VersionViewSetCreateUpdateMixin, Tes
         assert alog.action == amo.LOG.DISABLE_VERSION.id
 
     def test_cannot_disable_if_promoted(self):
-        self.make_addon_promoted(self.addon, RECOMMENDED, approve_version=True)
+        self.make_addon_promoted(
+            self.addon, PROMOTED_GROUP_CHOICES.RECOMMENDED, approve_version=True
+        )
 
         response = self.client.patch(self.url, data={'is_disabled': True})
         assert response.status_code == 400
@@ -4561,7 +4658,9 @@ class TestVersionViewSetDelete(TestCase):
         assert self.version.reload().deleted
 
     def test_cannot_delete_if_promoted(self):
-        self.make_addon_promoted(self.addon, RECOMMENDED, approve_version=True)
+        self.make_addon_promoted(
+            self.addon, PROMOTED_GROUP_CHOICES.RECOMMENDED, approve_version=True
+        )
         self.client.login_api(self.user)
 
         response = self.client.delete(self.url)
@@ -4611,7 +4710,9 @@ class TestVersionViewSetList(AddonAndVersionViewSetDetailMixin, TestCase):
         # shown when requesting to see unlisted stuff explicitly, with the
         # right permissions.
         self.unlisted_version = version_factory(
-            addon=self.addon, version='42.0', channel=amo.CHANNEL_UNLISTED
+            addon=self.addon,
+            version=amo.DEFAULT_WEBEXT_MIN_VERSION,
+            channel=amo.CHANNEL_UNLISTED,
         )
 
         self._set_tested_url(self.addon.pk)
@@ -4950,7 +5051,7 @@ class TestVersionViewSetList(AddonAndVersionViewSetDetailMixin, TestCase):
         assert 'source' not in self.client.get(self.url).data['results'][0]
         assert 'source' not in self.client.get(self.url).data['results'][1]
 
-        user = UserProfile.objects.create(username='user')
+        user = user_factory()
         self.client.login_api(user)
 
         # logged in but not an author
@@ -4973,6 +5074,7 @@ class TestAddonViewSetEulaPolicy(TestCase):
             guid=generate_addon_guid(), name='My Addôn', slug='my-addon'
         )
         self.url = reverse_ns('addon-eula-policy', kwargs={'pk': self.addon.pk})
+        self.user = user_factory(read_dev_agreement=self.days_ago(1))
 
     def test_url(self):
         self.detail_url = reverse_ns('addon-detail', kwargs={'pk': self.addon.pk})
@@ -4983,22 +5085,240 @@ class TestAddonViewSetEulaPolicy(TestCase):
         response = self.client.get(self.url)
         assert response.status_code == 401
 
-    def test_policy_none(self):
+    def test_eula_and_policy_none(self):
         response = self.client.get(self.url)
         assert response.status_code == 200
         data = json.loads(force_str(response.content))
-        assert data['eula'] is None
-        assert data['privacy_policy'] is None
+        assert data == {
+            'eula': None,
+            'privacy_policy': None,
+        }
 
-    def test_policy(self):
+    def test_eula_and_policy(self):
         self.addon.eula = {'en-US': 'My Addôn EULA', 'fr': 'Hoüla'}
         self.addon.privacy_policy = 'My Prïvacy, My Policy'
         self.addon.save()
         response = self.client.get(self.url)
         assert response.status_code == 200
         data = json.loads(force_str(response.content))
+        assert list(data.keys()) == ['eula', 'privacy_policy']
         assert data['eula'] == {'en-US': 'My Addôn EULA', 'fr': 'Hoüla'}
         assert data['privacy_policy'] == {'en-US': 'My Prïvacy, My Policy'}
+
+    def test_update_non_author(self):
+        self.client.login_api(self.user)
+        response = self.client.patch(
+            self.url,
+            {
+                'eula': {
+                    'en-US': 'My Updated Add-on EULA in English',
+                    'fr': 'Mes Conditions générales d’utilisation',
+                },
+                'privacy_policy': {
+                    'en-US': 'My privacy policy',
+                },
+            },
+        )
+        assert response.status_code == 403
+
+        response = self.client.put(
+            self.url,
+            {
+                'eula': {
+                    'en-US': 'My Updated Add-on EULA in English',
+                    'fr': 'Mes Conditions générales d’utilisation',
+                },
+                'privacy_policy': {
+                    'en-US': 'My privacy policy',
+                },
+            },
+        )
+        assert response.status_code == 405
+
+    def test_update_anonymous(self):
+        response = self.client.patch(
+            self.url,
+            {
+                'eula': {
+                    'en-US': 'My Updated Add-on EULA in English',
+                    'fr': 'Mes Conditions générales d’utilisation',
+                },
+                'privacy_policy': {
+                    'en-US': 'My privacy policy',
+                },
+            },
+        )
+        assert response.status_code == 401
+
+        response = self.client.put(
+            self.url,
+            {
+                'eula': {
+                    'en-US': 'My Updated Add-on EULA in English',
+                    'fr': 'Mes Conditions générales d’utilisation',
+                },
+                'privacy_policy': {
+                    'en-US': 'My privacy policy',
+                },
+            },
+        )
+        assert response.status_code == 401
+
+    def test_update(self):
+        AddonUser.objects.create(user=self.user, addon=self.addon)
+        self.client.login_api(self.user)
+        assert not ActivityLog.objects.filter(
+            action=amo.LOG.EDIT_PROPERTIES.id
+        ).exists()
+        response = self.client.patch(
+            self.url,
+            {
+                'eula': {
+                    'en-US': 'My Updated Add-on EULA in English',
+                    'fr': 'Mes Conditions générales d’utilisation',
+                },
+                'privacy_policy': {
+                    'en-US': 'My privacy policy',
+                },
+            },
+        )
+        assert response.status_code == 200
+        data = json.loads(force_str(response.content))
+        assert list(data.keys()) == ['eula', 'privacy_policy']
+        assert data['eula'] == {
+            'en-US': 'My Updated Add-on EULA in English',
+            'fr': 'Mes Conditions générales d’utilisation',
+        }
+        assert data['privacy_policy'] == {
+            'en-US': 'My privacy policy',
+        }
+        self.addon.reload()
+        assert str(self.addon.eula) == 'My Updated Add-on EULA in English'
+        assert str(self.addon.privacy_policy) == 'My privacy policy'
+        with self.activate('fr'):
+            self.addon = Addon.objects.get(pk=self.addon.pk)
+            assert str(self.addon.eula) == 'Mes Conditions générales d’utilisation'
+            assert str(self.addon.privacy_policy) == 'My privacy policy'
+
+        assert ActivityLog.objects.filter(action=amo.LOG.EDIT_PROPERTIES.id).exists()
+        assert ActivityLog.objects.filter(action=amo.LOG.EDIT_PROPERTIES.id)[
+            0
+        ].details == ['eula', 'privacy_policy']
+
+    def test_update_put(self):
+        AddonUser.objects.create(user=self.user, addon=self.addon)
+        self.client.login_api(self.user)
+        response = self.client.put(
+            self.url,
+            {
+                'eula': {
+                    'en-US': 'My Updated Add-on EULA in English',
+                    'fr': 'Mes Conditions générales d’utilisation',
+                },
+                'privacy_policy': {
+                    'en-US': 'My privacy policy',
+                },
+            },
+        )
+        assert response.status_code == 405
+
+    def test_update_author_not_read_dev_agreement(self):
+        AddonUser.objects.create(user=self.user, addon=self.addon)
+        self.user.update(read_dev_agreement=None)
+        self.client.login_api(self.user)
+        response = self.client.patch(
+            self.url,
+            {
+                'eula': {
+                    'en-US': 'My Updated Add-on EULA in English',
+                    'fr': 'Mes Conditions générales d’utilisation',
+                },
+                'privacy_policy': {
+                    'en-US': 'My privacy policy',
+                },
+            },
+        )
+        assert response.status_code == 403
+        self.addon.reload()
+        assert not self.addon.eula
+        assert not self.addon.privacy_policy
+
+    def test_update_reviewer_not_author(self):
+        self.grant_permission(self.user, 'Addons:Review')
+        self.client.login_api(self.user)
+        response = self.client.patch(
+            self.url,
+            {
+                'eula': {
+                    'en-US': 'My Updated Add-on EULA in English',
+                    'fr': 'Mes Conditions générales d’utilisation',
+                },
+                'privacy_policy': {
+                    'en-US': 'My privacy policy',
+                },
+            },
+        )
+        assert response.status_code == 403
+        self.addon.reload()
+        assert not self.addon.eula
+        assert not self.addon.privacy_policy
+
+    def test_update_disabled(self):
+        AddonUser.objects.create(user=self.user, addon=self.addon)
+        self.client.login_api(self.user)
+        self.addon.update(status=amo.STATUS_DISABLED)
+        response = self.client.patch(
+            self.url,
+            {
+                'eula': {
+                    'en-US': 'My Updated Add-on EULA in English',
+                    'fr': 'Mes Conditions générales d’utilisation',
+                },
+                'privacy_policy': {
+                    'en-US': 'My privacy policy',
+                },
+            },
+        )
+        assert response.status_code == 403
+        self.addon.reload()
+        assert not self.addon.eula
+        assert not self.addon.privacy_policy
+
+    def test_update_something_else(self):
+        assert self.addon.summary
+        original_summary = self.addon.summary
+        AddonUser.objects.create(user=self.user, addon=self.addon)
+        self.client.login_api(self.user)
+        response = self.client.patch(
+            self.url,
+            {'summary': 'attempting to change the summary via wrong endpoint'},
+        )
+        assert response.status_code == 200  # We ignore unknown fields
+        data = json.loads(force_str(response.content))
+        assert data == {'eula': None, 'privacy_policy': None}
+        self.addon.reload()
+        assert self.addon.summary == original_summary
+
+    def test_update_on_theme(self):
+        self.addon.update(type=amo.ADDON_STATICTHEME)
+        AddonUser.objects.create(user=self.user, addon=self.addon)
+        self.client.login_api(self.user)
+        response = self.client.patch(
+            self.url,
+            {
+                'eula': {
+                    'en-US': 'My Updated Add-on EULA in English',
+                    'fr': 'Mes Conditions générales d’utilisation',
+                },
+                'privacy_policy': {
+                    'en-US': 'My privacy policy',
+                },
+            },
+        )
+        assert response.status_code == 400
+        assert response.json() == {
+            'non_field_errors': ['This endpoint is not valid for Themes.']
+        }
 
 
 class TestAddonSearchView(ESTestCase):
@@ -5297,10 +5617,12 @@ class TestAddonSearchView(ESTestCase):
 
     def test_filter_by_featured_no_app_no_lang(self):
         addon = addon_factory(
-            slug='my-addon', name='Featured Addôn', promoted=RECOMMENDED
+            slug='my-addon',
+            name='Featured Addôn',
+            promoted_id=PROMOTED_GROUP_CHOICES.RECOMMENDED,
         )
         addon_factory(slug='other-addon', name='Other Addôn')
-        assert addon.promoted_group() == RECOMMENDED
+        assert addon.promoted_group().id == PROMOTED_GROUP_CHOICES.RECOMMENDED
         self.reindex(Addon)
 
         data = self.perform_search(self.url, {'featured': 'true'})
@@ -5316,18 +5638,22 @@ class TestAddonSearchView(ESTestCase):
             application=amo.ANDROID.id, version='60.0.0'
         )
 
-        addon = addon_factory(name='Recomménded Addôn', promoted=RECOMMENDED)
+        addon = addon_factory(
+            name='Recomménded Addôn', promoted_id=PROMOTED_GROUP_CHOICES.RECOMMENDED
+        )
         ApplicationsVersions.objects.get_or_create(
             application=amo.ANDROID.id,
             version=addon.current_version,
             min=av_min,
             max=av_max,
         )
-        assert addon.promoted_group() == RECOMMENDED
+        assert addon.promoted_group().id == PROMOTED_GROUP_CHOICES.RECOMMENDED
         assert addon.promotedaddon.application_id is None  # i.e. all
         assert addon.promotedaddon.approved_applications == [amo.FIREFOX, amo.ANDROID]
 
-        addon2 = addon_factory(name='Fírefox Addôn', promoted=RECOMMENDED)
+        addon2 = addon_factory(
+            name='Fírefox Addôn', promoted_id=PROMOTED_GROUP_CHOICES.RECOMMENDED
+        )
         ApplicationsVersions.objects.get_or_create(
             application=amo.ANDROID.id,
             version=addon2.current_version,
@@ -5336,7 +5662,7 @@ class TestAddonSearchView(ESTestCase):
         )
         # This case is approved for all apps, but now only set for Firefox
         addon2.promotedaddon.update(application_id=amo.FIREFOX.id)
-        assert addon2.promoted_group() == RECOMMENDED
+        assert addon2.promoted_group().id == PROMOTED_GROUP_CHOICES.RECOMMENDED
         assert addon2.promotedaddon.application_id is amo.FIREFOX.id
         assert addon2.promotedaddon.approved_applications == [amo.FIREFOX]
 
@@ -5357,11 +5683,11 @@ class TestAddonSearchView(ESTestCase):
             min=av_min,
             max=av_max,
         )
-        self.make_addon_promoted(addon4, RECOMMENDED)
+        self.make_addon_promoted(addon4, PROMOTED_GROUP_CHOICES.RECOMMENDED)
         addon4.promotedaddon.update(application_id=amo.FIREFOX.id)
         addon4.promotedaddon.approve_for_version(addon4.current_version)
         addon4.promotedaddon.update(application_id=None)
-        assert addon4.promoted_group() == RECOMMENDED
+        assert addon4.promoted_group().id == PROMOTED_GROUP_CHOICES.RECOMMENDED
         assert addon4.promotedaddon.application_id is None  # i.e. all
         assert addon4.promotedaddon.approved_applications == [amo.FIREFOX]
 
@@ -5373,11 +5699,11 @@ class TestAddonSearchView(ESTestCase):
             min=av_min,
             max=av_max,
         )
-        self.make_addon_promoted(addon5, RECOMMENDED)
+        self.make_addon_promoted(addon5, PROMOTED_GROUP_CHOICES.RECOMMENDED)
         addon5.promotedaddon.update(application_id=amo.ANDROID.id)
         addon5.promotedaddon.approve_for_version(addon5.current_version)
         addon5.promotedaddon.update(application_id=None)
-        assert addon5.promoted_group() == RECOMMENDED
+        assert addon5.promoted_group().id == PROMOTED_GROUP_CHOICES.RECOMMENDED
         assert addon5.promotedaddon.application_id is None  # i.e. all
         assert addon5.promotedaddon.approved_applications == [amo.ANDROID]
 
@@ -5414,11 +5740,21 @@ class TestAddonSearchView(ESTestCase):
         assert {res['id'] for res in data['results']} == {addon.pk, addon5.pk}
 
         # test with other other promotions
-        for promo in (SPONSORED, VERIFIED, LINE, SPOTLIGHT, STRATEGIC):
-            self.make_addon_promoted(addon, promo, approve_version=True)
+        for group_id, group_name in (
+            (PROMOTED_GROUP_CHOICES.LINE, PROMOTED_GROUP_CHOICES.LINE.api_value),
+            (
+                PROMOTED_GROUP_CHOICES.SPOTLIGHT,
+                PROMOTED_GROUP_CHOICES.SPOTLIGHT.api_value,
+            ),
+            (
+                PROMOTED_GROUP_CHOICES.STRATEGIC,
+                PROMOTED_GROUP_CHOICES.STRATEGIC.api_value,
+            ),
+        ):
+            self.make_addon_promoted(addon, group_id, approve_version=True)
             self.reindex(Addon)
             data = self.perform_search(
-                self.url, {'promoted': promo.api_name, 'app': 'firefox'}
+                self.url, {'promoted': group_name, 'app': 'firefox'}
             )
             assert data['count'] == 1
             assert len(data['results']) == 1
@@ -5802,7 +6138,7 @@ class TestAddonSearchView(ESTestCase):
             name='My Addôn',
             guid='random@guid',
             popularity=999,
-            promoted=RECOMMENDED,
+            promoted_id=PROMOTED_GROUP_CHOICES.RECOMMENDED,
         )
         addon_factory()
         self.reindex(Addon)
@@ -5877,6 +6213,7 @@ class TestAddonSearchView(ESTestCase):
         assert data == ['Return To AMO is currently disabled']
 
     def test_find_addon_default_non_en_us(self):
+        url = reverse_ns('addon-search')
         with self.activate('en-GB'):
             addon = addon_factory(
                 status=amo.STATUS_APPROVED,
@@ -5887,19 +6224,27 @@ class TestAddonSearchView(ESTestCase):
                 summary='Banana Summary',
             )
 
-            addon.name = {'es': 'Banana Bonkers espanole'}
-            addon.description = {'es': 'Deje que su navegador coma sus plátanos'}
-            addon.summary = {'es': 'resumen banana'}
+            addon.name = {'es-ES': 'Banana Bonkers espanole'}
+            addon.description = {'es-ES': 'Deje que su navegador coma sus plátanos'}
+            addon.summary = {'es-ES': 'resumen banana'}
             addon.save()
 
         addon_factory(slug='English Addon', name='My English Addôn')
 
         self.reindex(Addon)
 
-        for locale in ('en-US', 'en-GB', 'es'):
-            with self.activate(locale):
-                url = reverse_ns('addon-search')
+        expected_name = {
+            # name is not translated in en-US, we return en-GB, indicating that
+            # it was the default.
+            'en-US': {'_default': 'en-GB', 'en-GB': 'Banana Bonkers', 'en-US': None},
+            # name was translated in en-GB
+            'en-GB': {'en-GB': 'Banana Bonkers'},
+            # name was translated in en-ES
+            'es-ES': {'es-ES': 'Banana Bonkers espanole'},
+        }
 
+        for locale in ('en-US', 'en-GB', 'es-ES'):
+            with self.activate(locale):
                 data = self.perform_search(url, {'lang': locale})
 
                 assert data['count'] == 2
@@ -5910,6 +6255,52 @@ class TestAddonSearchView(ESTestCase):
                 result = data['results'][0]
                 assert result['id'] == addon.pk
                 assert result['slug'] == addon.slug
+                assert result['name'] == expected_name[locale]
+
+    def test_find_addon_default_non_en_us_v4(self):
+        url = reverse_ns('addon-search', api_version='v4')
+        with self.activate('en-GB'):
+            addon = addon_factory(
+                status=amo.STATUS_APPROVED,
+                type=amo.ADDON_EXTENSION,
+                default_locale='en-GB',
+                name='Banana Bonkers',
+                description='Let your browser eat your bananas',
+                summary='Banana Summary',
+            )
+
+            addon.name = {'es-ES': 'Banana Bonkers espanole'}
+            addon.description = {'es-ES': 'Deje que su navegador coma sus plátanos'}
+            addon.summary = {'es-ES': 'resumen banana'}
+            addon.save()
+
+        addon_factory(slug='English Addon', name='My English Addôn')
+
+        self.reindex(Addon)
+
+        expected_name = {
+            # name is not translated in en-US, we return the default locale
+            # translation, en-GB.
+            'en-US': 'Banana Bonkers',
+            # name was translated in en-GB
+            'en-GB': 'Banana Bonkers',
+            # name was translated in en-ES
+            'es-ES': 'Banana Bonkers espanole',
+        }
+
+        for locale in ('en-US', 'en-GB', 'es-ES'):
+            with self.activate(locale):
+                data = self.perform_search(url, {'lang': locale})
+
+                assert data['count'] == 2
+                assert len(data['results']) == 2
+
+                data = self.perform_search(url, {'q': 'Banana', 'lang': locale})
+
+                result = data['results'][0]
+                assert result['id'] == addon.pk
+                assert result['slug'] == addon.slug
+                assert result['name'] == expected_name[locale]
 
     def test_exclude_addons(self):
         addon1 = addon_factory()
@@ -5998,8 +6389,12 @@ class TestAddonSearchView(ESTestCase):
         assert ids == [addon1.id, addon2.id, addon3.id, addon4.id, addon5.id]
 
         # Now made some of the add-ons recommended
-        self.make_addon_promoted(addon2, RECOMMENDED, approve_version=True)
-        self.make_addon_promoted(addon4, RECOMMENDED, approve_version=True)
+        self.make_addon_promoted(
+            addon2, PROMOTED_GROUP_CHOICES.RECOMMENDED, approve_version=True
+        )
+        self.make_addon_promoted(
+            addon4, PROMOTED_GROUP_CHOICES.RECOMMENDED, approve_version=True
+        )
         self.refresh()
 
         data = self.perform_search(self.url)  # No query.
@@ -6204,8 +6599,10 @@ class TestAddonAutoCompleteSearchView(ESTestCase):
 
     def test_promoted(self):
         not_promoted = addon_factory(name='not promoted')
-        sponsored = addon_factory(name='is promoted')
-        self.make_addon_promoted(sponsored, SPONSORED, approve_version=True)
+        spotlight = addon_factory(name='is promoted')
+        self.make_addon_promoted(
+            spotlight, PROMOTED_GROUP_CHOICES.SPOTLIGHT, approve_version=True
+        )
         addon_factory(name='something')
 
         self.refresh()
@@ -6216,14 +6613,14 @@ class TestAddonAutoCompleteSearchView(ESTestCase):
         assert 'prev' not in data
         assert len(data['results']) == 2
 
-        assert {itm['id'] for itm in data['results']} == {not_promoted.pk, sponsored.pk}
+        assert {itm['id'] for itm in data['results']} == {not_promoted.pk, spotlight.pk}
 
-        sponsored_result, not_result = (
+        spotlight_result, not_result = (
             (data['results'][0], data['results'][1])
-            if data['results'][0]['id'] == sponsored.id
+            if data['results'][0]['id'] == spotlight.id
             else (data['results'][1], data['results'][0])
         )
-        assert sponsored_result['promoted']['category'] == 'sponsored'
+        assert spotlight_result['promoted']['category'] == 'spotlight'
         assert not_result['promoted'] is None
 
 
@@ -6243,10 +6640,10 @@ class TestAddonFeaturedView(ESTestCase):
         self.refresh()
 
     def test_basic(self):
-        addon1 = addon_factory(promoted=RECOMMENDED)
-        addon2 = addon_factory(promoted=RECOMMENDED)
-        assert addon1.promoted_group() == RECOMMENDED
-        assert addon2.promoted_group() == RECOMMENDED
+        addon1 = addon_factory(promoted_id=PROMOTED_GROUP_CHOICES.RECOMMENDED)
+        addon2 = addon_factory(promoted_id=PROMOTED_GROUP_CHOICES.RECOMMENDED)
+        assert addon1.promoted_group().id == PROMOTED_GROUP_CHOICES.RECOMMENDED
+        assert addon2.promoted_group().id == PROMOTED_GROUP_CHOICES.RECOMMENDED
         addon_factory()  # not recommended so shouldn't show up
         self.refresh()
 
@@ -6261,7 +6658,7 @@ class TestAddonFeaturedView(ESTestCase):
 
     def test_page_size(self):
         for _ in range(0, 15):
-            addon_factory(promoted=RECOMMENDED)
+            addon_factory(promoted_id=PROMOTED_GROUP_CHOICES.RECOMMENDED)
 
         self.refresh()
 
@@ -7013,6 +7410,17 @@ class TestAddonPreviewViewSet(TestCase):
         assert alog.action == amo.LOG.CHANGE_MEDIA.id
         assert alog.addonlog_set.get().addon == self.addon
 
+        self.create_flag('enable-submissions', note=':-(', everyone=False)
+        response = self.client.post(url)
+        assert response.status_code == 503
+        assert response.json() == {
+            'error': 'Add-on uploads are temporarily unavailable.',
+            'reason': ':-(',
+        }
+        self.create_flag('enable-submissions', note=':-(', users=[self.user.id])
+        response = self.client.post(url)
+        assert response.status_code != 503
+
     def test_cannot_create_for_themes(self):
         self.client.login_api(self.user)
         self.addon.update(type=amo.ADDON_STATICTHEME)
@@ -7028,7 +7436,7 @@ class TestAddonPreviewViewSet(TestCase):
         )
         assert response.status_code == 400, response.content
         assert response.data == {
-            'non_field_errors': ['Previews cannot be created for themes.']
+            'non_field_errors': ['This endpoint is not valid for Themes.']
         }
 
         self.addon.reload()
@@ -7474,6 +7882,15 @@ class TestAddonPendingAuthorViewSet(TestCase):
             (self.user.email, self.pending_author.user.email)
         )
 
+    def test_update_role_same_id_as_addonuser(self):
+        # https://github.com/mozilla/addons/issues/14933
+        # Force the only AddonUserPendingConfirmation instance to have the same
+        # id as the only AddonUser instance, we should still be able to change
+        # that author invite.
+        AddonUserPendingConfirmation.objects.update(id=AddonUser.objects.get().pk)
+        self.pending_author = AddonUserPendingConfirmation.objects.get()
+        self.test_update_role()
+
     def test_confirm(self):
         AddonUser.objects.create(addon=self.addon, user=user_factory(), position=3)
         confirm_url = reverse_ns(
@@ -7624,3 +8041,24 @@ class TestBrowserMapping(TestCase):
             'extension_id': extension_id_2,
             'addon_guid': addon_2.guid,
         }
+
+
+class TestJavascriptCatalog(TestCase):
+    @pytest.mark.needs_locales_compilation
+    def test_get_correct_catalog(self):
+        url = reverse('javascript-catalog', kwargs={'locale': 'fr'})
+        content = self.client.get(url).content.decode('utf-8')
+        # Check the key is present
+        assert 'There was an error uploading your file.' in content
+        # Check the translation is in the correct locale
+        assert (
+            '"Une erreur est survenue pendant l\\u2019envoi de votre fichier."'
+            in content
+        )
+
+    @pytest.mark.needs_locales_compilation
+    def test_long_locales(self):
+        for locale in ['en-US', 'sr-Latn', 'cak']:
+            url = reverse('javascript-catalog', kwargs={'locale': locale})
+            content = self.client.get(url).content.decode('utf-8')
+            assert 'There was an error uploading your file.' in content

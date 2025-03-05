@@ -5,10 +5,23 @@ updates:
   schedule:
     interval: daily
   open-pull-requests-limit: 99
+- package-ecosystem: "github-actions"
+  directory: "/"
+  schedule:
+    interval: daily
 - package-ecosystem: pip
   directory: "/requirements"
   schedule:
     interval: daily
+  groups:
+      google:
+        patterns:
+          - "google-*"
+      celery:
+        patterns:
+          - celery
+          - billiard
+          - kombu
   open-pull-requests-limit: 99
   ignore:
   - dependency-name: django
@@ -34,7 +47,7 @@ updates:
     - ">= 6"
   - dependency-name: idna
     versions:
-    - ">= 3"
+    - ">= 4"
   - dependency-name: amqp
     versions:
     - ">= 6"

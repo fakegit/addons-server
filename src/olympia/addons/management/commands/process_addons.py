@@ -6,7 +6,9 @@ from olympia import amo
 from olympia.abuse.models import AbuseReport
 from olympia.addons.models import Addon
 from olympia.addons.tasks import (
+    ERRONEOUSLY_ADDED_OVERGROWTH_DATE_RANGE,
     delete_addons,
+    delete_erroneously_added_overgrowth_needshumanreview,
     extract_colors_from_static_themes,
     find_inconsistencies_between_es_and_db,
     recreate_theme_previews,
@@ -20,8 +22,9 @@ from olympia.constants.base import (
     _ADDON_WEBAPP,
 )
 from olympia.devhub.tasks import get_preview_sizes, recreate_previews
-from olympia.lib.crypto.tasks import sign_addons
+from olympia.lib.crypto.tasks import bump_and_resign_addons
 from olympia.ratings.tasks import addon_rating_aggregates
+from olympia.reviewers.models import NeedsHumanReview
 from olympia.reviewers.tasks import recalculate_post_review_weight
 from olympia.versions.tasks import delete_list_theme_previews
 
@@ -72,14 +75,20 @@ class Command(ProcessObjectsCommand):
                 'task': recalculate_post_review_weight,
                 'queryset_filters': get_recalc_needed_filters(),
             },
-            'resign_addons_for_cose': {
-                'task': sign_addons,
+            'bump_and_resign_addons': {
+                'task': bump_and_resign_addons,
                 'queryset_filters': [
                     # Only resign public add-ons where the latest version has been
                     # created before the 5th of April
                     Q(
                         status=amo.STATUS_APPROVED,
                         _current_version__created__lt=datetime(2019, 4, 5),
+                        disabled_by_user=False,
+                        type__in=(
+                            amo.ADDON_EXTENSION,
+                            amo.ADDON_STATICTHEME,
+                            amo.ADDON_DICT,
+                        ),
                     )
                 ],
             },
@@ -137,6 +146,21 @@ class Command(ProcessObjectsCommand):
             'update_rating_aggregates': {
                 'task': addon_rating_aggregates,
                 'queryset_filters': [Q(status=amo.STATUS_APPROVED)],
+            },
+            # https://github.com/mozilla/addons/issues/15141
+            'delete_erroneously_added_overgrowth_needshumanreview': {
+                'task': delete_erroneously_added_overgrowth_needshumanreview,
+                'queryset_filters': [
+                    Q(
+                        versions__needshumanreview__reason=(
+                            NeedsHumanReview.REASONS.HOTNESS_THRESHOLD
+                        ),
+                        versions__needshumanreview__created__range=(
+                            ERRONEOUSLY_ADDED_OVERGROWTH_DATE_RANGE
+                        ),
+                        versions__needshumanreview__is_active=True,
+                    )
+                ],
             },
         }
 

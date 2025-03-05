@@ -4,6 +4,7 @@ Management utility to create superusers.
 Inspired by django.contrib.auth.management.commands.createsuperuser.
 (http://bit.ly/2cTgsNV)
 """
+
 import json
 from datetime import datetime
 
@@ -72,7 +73,7 @@ and email address and that's it.
                             'You must use --%s with --noinput.' % field_name
                         )
             except exceptions.ValidationError as exc:
-                raise CommandError('; '.join(exc.messages))
+                raise CommandError('; '.join(exc.messages)) from exc
         else:
             user_data = {
                 field_name: self.get_value(field_name)

@@ -32,6 +32,7 @@ from olympia.amo.utils import chunked
 from olympia.applications.models import AppVersion
 from olympia.files.models import (
     File,
+    FileManifest,
     FileUpload,
     FileValidation,
     WebextPermission,
@@ -370,14 +371,16 @@ class TestFile(TestCase, amo.tests.AMOPaths):
         assert file.get_review_status_display() == 'Approved'
 
     def test_file_status_signal(self):
-        addon = addon_factory(reviewer_flags={'auto_approval_disabled': True})
-        version = addon.current_version
+        user_factory(pk=settings.TASK_USER_ID)
+        addon = addon_factory(file_kw={'status': amo.STATUS_DISABLED})
+        version = addon.versions.get()
+        version.needshumanreview_set.create()
         assert not version.due_date
 
         version.file.update(status=amo.STATUS_AWAITING_REVIEW)
         assert version.reload().due_date
 
-        version.file.update(status=amo.STATUS_APPROVED)
+        version.file.update(status=amo.STATUS_DISABLED)
         assert not version.reload().due_date
 
 
@@ -428,7 +431,6 @@ class TestParseXpi(amo.tests.AMOPaths, TestCase):
     def setUpTestData(cls):
         versions = {
             amo.DEFAULT_WEBEXT_MIN_VERSION,
-            amo.DEFAULT_WEBEXT_MIN_VERSION_NO_ID,
             amo.DEFAULT_WEBEXT_MIN_VERSION_ANDROID,
             amo.DEFAULT_STATIC_THEME_MIN_VERSION_FIREFOX,
             amo.DEFAULT_WEBEXT_DICT_MIN_VERSION_FIREFOX,
@@ -436,8 +438,12 @@ class TestParseXpi(amo.tests.AMOPaths, TestCase):
             amo.DEFAULT_WEBEXT_MIN_VERSION_MV3_FIREFOX,
         }
         for version in versions:
-            AppVersion.objects.create(application=amo.FIREFOX.id, version=version)
-            AppVersion.objects.create(application=amo.ANDROID.id, version=version)
+            AppVersion.objects.get_or_create(
+                application=amo.FIREFOX.id, version=version
+            )
+            AppVersion.objects.get_or_create(
+                application=amo.ANDROID.id, version=version
+            )
 
     def setUp(self):
         self.user = user_factory()
@@ -450,7 +456,7 @@ class TestParseXpi(amo.tests.AMOPaths, TestCase):
 
         with open(self.file_fixture_path(filename), 'rb') as fobj:
             file_ = SimpleUploadedFile(filename, fobj.read())
-            return parse_addon(file_, addon, **parse_addon_kwargs)
+            return parse_addon(file_, addon=addon, **parse_addon_kwargs)
 
     def test_parse_basics(self):
         # Basic test for key properties (more advanced testing is done in other
@@ -537,12 +543,17 @@ class TestParseXpi(amo.tests.AMOPaths, TestCase):
         expected = [
             ApplicationsVersions(
                 application=amo.FIREFOX.id,
-                min=AppVersion.objects.get(application=amo.FIREFOX.id, version='42.0'),
+                min=AppVersion.objects.get(
+                    application=amo.FIREFOX.id, version=amo.DEFAULT_WEBEXT_MIN_VERSION
+                ),
                 max=AppVersion.objects.get(application=amo.FIREFOX.id, version='*'),
             ),
             ApplicationsVersions(
                 application=amo.ANDROID.id,
-                min=AppVersion.objects.get(application=amo.ANDROID.id, version='48.0'),
+                min=AppVersion.objects.get(
+                    application=amo.ANDROID.id,
+                    version=amo.DEFAULT_WEBEXT_MIN_VERSION_ANDROID,
+                ),
                 max=AppVersion.objects.get(application=amo.ANDROID.id, version='*'),
             ),
         ]
@@ -554,8 +565,8 @@ class TestParseXpi(amo.tests.AMOPaths, TestCase):
             assert avs.max == expected[idx].max
 
     def test_no_parse_apps_error_webextension(self):
-        AppVersion.objects.create(application=amo.FIREFOX.id, version='57.0')
-        AppVersion.objects.create(application=amo.ANDROID.id, version='57.0')
+        AppVersion.objects.create(application=amo.FIREFOX.id, version='59.0')
+        AppVersion.objects.create(application=amo.ANDROID.id, version='59.0')
         assert self.parse(filename='webextension_with_apps_targets.xpi')
 
         assert self.parse(filename='webextension_with_apps_targets.xpi', minimal=False)
@@ -611,17 +622,19 @@ class TestParseXpi(amo.tests.AMOPaths, TestCase):
         # really matter what we set here, we allow updates to an add-on
         # with a XPI that has no id.
         addon = Addon.objects.create(
-            guid='e2c45b71-6cbb-452c-97a5-7e8039cc6535', type=1
+            guid='e2c45b71-6cbb-452c-97a5-7e8039cc6535', type=amo.ADDON_EXTENSION
         )
         info = self.parse(addon, filename='webextension_no_id.xpi')
         assert info['guid'] == addon.guid
 
     def test_match_type(self):
-        addon = Addon.objects.create(guid='@webextension-guid', type=4)
+        addon = Addon.objects.create(
+            guid='@webextension-guid', type=amo.ADDON_STATICTHEME
+        )
         with self.assertRaises(forms.ValidationError) as e:
             self.parse(addon)
         assert e.exception.messages[0] == (
-            'The type (1) does not match the type of your add-on on AMO (4)'
+            'The type (Extension) does not match the type of your add-on on AMO (Theme)'
         )
 
     def test_match_type_extension_for_webextension_experiments(self):
@@ -662,7 +675,7 @@ class TestParseXpi(amo.tests.AMOPaths, TestCase):
         with self.assertRaises(forms.ValidationError) as e:
             # This file doesn't exist, it will raise an IOError that should
             # be caught and re-raised as a ValidationError.
-            parse_addon('baxmldzip.xpi', None)
+            parse_addon('baxmldzip.xpi', addon=None)
         assert e.exception.messages == ['Could not parse the manifest file.']
 
     def test_parse_langpack(self):
@@ -1180,7 +1193,6 @@ class TestFileFromUpload(UploadMixin, TestCase):
         versions = {
             amo.DEFAULT_WEBEXT_MIN_VERSION,
             amo.DEFAULT_WEBEXT_MAX_VERSION,
-            amo.DEFAULT_WEBEXT_MIN_VERSION_NO_ID,
             amo.DEFAULT_WEBEXT_MIN_VERSION_ANDROID,
         }
         for version in versions:
@@ -1247,6 +1259,22 @@ class TestFileFromUpload(UploadMixin, TestCase):
         assert fv.errors == 0
         assert fv.warnings == 1
         assert fv.notices == 2
+
+    def test_file_manifest(self):
+        upload = self.upload('webextension.xpi')
+        file = File.from_upload(upload, self.version, parsed_data=self.parsed_data)
+        file_manifest = FileManifest.objects.get(file=file)
+        assert file_manifest.manifest_data == {
+            'applications': {
+                'gecko': {
+                    'id': '@webextension-guid',
+                },
+            },
+            'description': 'just a test addon with the manifest.json format',
+            'manifest_version': 2,
+            'name': 'My WebExtension Addon',
+            'version': '0.0.1',
+        }
 
     def test_filename_utf8_addon_slug(self):
         upload = self.upload('webextension.xpi')
@@ -1440,5 +1468,7 @@ class TestZip(TestCase, amo.tests.AMOPaths):
 def test_parse_addon(xpi_mock):
     user = mock.Mock()
 
-    parse_addon('file.xpi', None, user=user)
-    xpi_mock.assert_called_with('file.xpi', None, minimal=False, user=user)
+    parse_addon('file.xpi', addon=None, user=user)
+    xpi_mock.assert_called_with(
+        'file.xpi', addon=None, minimal=False, user=user, bypass_trademark_checks=False
+    )

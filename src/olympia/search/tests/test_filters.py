@@ -3,6 +3,7 @@ from datetime import timedelta
 from unittest.mock import Mock, patch
 
 from django.test.client import RequestFactory
+from django.test.utils import override_settings
 from django.utils import translation
 from django.utils.http import urlsafe_base64_encode
 
@@ -15,12 +16,8 @@ from olympia.amo.tests import TestCase
 from olympia.constants.categories import CATEGORIES
 from olympia.constants.promoted import (
     BADGED_GROUPS,
-    LINE,
     PROMOTED_API_NAME_TO_IDS,
-    RECOMMENDED,
-    SPONSORED,
-    STRATEGIC,
-    VERIFIED,
+    PROMOTED_GROUP_CHOICES,
 )
 from olympia.search.filters import (
     AddonRatingQueryParam,
@@ -38,11 +35,12 @@ class FilterTestsBase(TestCase):
 
     def setUp(self):
         super().setUp()
-        self.req = RequestFactory().get('/')
         self.view_class = Mock()
 
     def _filter(self, req=None, data=None):
-        req = req or RequestFactory().get('/', data=data or {})
+        if not req:
+            req = RequestFactory().get('/api/v5/', data=data or {})
+            req.version = 'v5'
         queryset = Search()
         for filter_class in self.filter_classes:
             queryset = filter_class().filter_queryset(req, queryset, self.view_class)
@@ -74,8 +72,7 @@ class TestQueryFilter(FilterTestsBase):
 
         assert should[1] == {
             'multi_match': {
-                '_name': 'MultiMatch(name_l10n_en-us,name_l10n_en-ca,'
-                'name_l10n_en-gb)',
+                '_name': 'MultiMatch(name_l10n_en-us,name_l10n_en-ca,name_l10n_en-gb)',
                 'analyzer': 'english',
                 'boost': 5.0,
                 'fields': ['name_l10n_en-us', 'name_l10n_en-ca', 'name_l10n_en-gb'],
@@ -129,7 +126,7 @@ class TestQueryFilter(FilterTestsBase):
                     {
                         'match': {
                             'name.trigrams': {
-                                'minimum_should_match': '66%',
+                                'minimum_should_match': '67%',
                                 'query': query,
                             }
                         }
@@ -193,7 +190,14 @@ class TestQueryFilter(FilterTestsBase):
             'weight': 4.0,
         }
         assert functions[2] == {
-            'filter': {'terms': {'promoted.group_id': [RECOMMENDED.id, LINE.id]}},
+            'filter': {
+                'terms': {
+                    'promoted.group_id': [
+                        PROMOTED_GROUP_CHOICES.RECOMMENDED,
+                        PROMOTED_GROUP_CHOICES.LINE,
+                    ]
+                }
+            },
             'weight': 5.0,
         }
         return qs
@@ -290,7 +294,7 @@ class TestQueryFilter(FilterTestsBase):
                         'match': {
                             'name.trigrams': {
                                 'query': 'blah',
-                                'minimum_should_match': '66%',
+                                'minimum_should_match': '67%',
                             }
                         }
                     },
@@ -321,7 +325,7 @@ class TestQueryFilter(FilterTestsBase):
                         'match': {
                             'name.trigrams': {
                                 'query': 'search terms',
-                                'minimum_should_match': '66%',
+                                'minimum_should_match': '67%',
                             }
                         }
                     },
@@ -357,7 +361,7 @@ class TestQueryFilter(FilterTestsBase):
                         'match': {
                             'name.trigrams': {
                                 'query': 'this search query is too long.',
-                                'minimum_should_match': '66%',
+                                'minimum_should_match': '67%',
                             }
                         }
                     },
@@ -419,7 +423,7 @@ class TestReviewedContentFilter(FilterTestsBase):
     filter_classes = [ReviewedContentFilter]
 
     def test_status(self):
-        qs = self._filter(self.req)
+        qs = self._filter()
         assert 'must' not in qs['query']['bool']
         filter_ = qs['query']['bool']['filter']
 
@@ -948,7 +952,16 @@ class TestSearchParameterFilter(FilterTestsBase):
         # test multiple param values
         qs = self._filter(data={'promoted': 'recommended,line'})
         filter_ = qs['query']['bool']['filter']
-        assert [{'terms': {'promoted.group_id': [RECOMMENDED.id, LINE.id]}}] == filter_
+        assert [
+            {
+                'terms': {
+                    'promoted.group_id': [
+                        PROMOTED_GROUP_CHOICES.RECOMMENDED,
+                        PROMOTED_GROUP_CHOICES.LINE,
+                    ]
+                }
+            }
+        ] == filter_
 
         # test combining multiple values with the meta "badged" group
         qs = self._filter(data={'promoted': 'badged,recommended,strategic'})
@@ -958,15 +971,34 @@ class TestSearchParameterFilter(FilterTestsBase):
                 'terms': {
                     'promoted.group_id': [
                         # recommended shouldn't be there twice
-                        RECOMMENDED.id,
-                        SPONSORED.id,
-                        VERIFIED.id,
-                        LINE.id,
-                        STRATEGIC.id,
+                        PROMOTED_GROUP_CHOICES.RECOMMENDED,
+                        PROMOTED_GROUP_CHOICES.LINE,
+                        PROMOTED_GROUP_CHOICES.STRATEGIC,
                     ]
                 }
             }
         ] == filter_
+
+    def test_search_by_promoted_obsolete_groups(self):
+        with self.assertRaises(serializers.ValidationError) as context:
+            with override_settings(DRF_API_GATES={}):
+                self._filter(data={'promoted': 'sponsored,line'})
+        assert context.exception.detail == ['Invalid "promoted" parameter.']
+
+        # test that now obsolete groups are silently filtered out
+        overridden_api_gates = {'v5': ('promoted-verified-sponsored',)}
+        with override_settings(DRF_API_GATES=overridden_api_gates):
+            qs = self._filter(data={'promoted': 'sponsored,line'})
+        filter_ = qs['query']['bool']['filter']
+        assert [
+            {'terms': {'promoted.group_id': [PROMOTED_GROUP_CHOICES.LINE]}}
+        ] == filter_
+
+        # and repeat to check when there are no groups remaining
+        with override_settings(DRF_API_GATES=overridden_api_gates):
+            qs = self._filter(data={'promoted': 'verified'})
+        filter_ = qs['query']['bool']['filter']
+        assert [{'terms': {'promoted.group_id': []}}] == filter_
 
     def test_search_by_color(self):
         qs = self._filter(data={'color': 'ff0000'})
@@ -1019,6 +1051,30 @@ class TestSearchParameterFilter(FilterTestsBase):
             {'range': {'colors.ratio': {'gte': 0.25}}},
         ]
 
+        qs = self._filter(data={'color': '#00ffffalotofjunk'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        inner = filter_[0]['nested']['query']['bool']['filter']
+        assert len(inner) == 4
+        assert inner == [
+            {'range': {'colors.s': {'gt': 6.375}}},
+            {'range': {'colors.l': {'gt': 12.75, 'lt': 249.9}}},
+            {'range': {'colors.h': {'gte': 101, 'lte': 153}}},
+            {'range': {'colors.ratio': {'gte': 0.25}}},
+        ]
+
+        qs = self._filter(data={'color': '00$#ff*$ff'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        inner = filter_[0]['nested']['query']['bool']['filter']
+        assert len(inner) == 4
+        assert inner == [
+            {'range': {'colors.s': {'gt': 6.375}}},
+            {'range': {'colors.l': {'gt': 12.75, 'lt': 249.9}}},
+            {'range': {'colors.h': {'gte': 101, 'lte': 153}}},
+            {'range': {'colors.ratio': {'gte': 0.25}}},
+        ]
+
     def test_search_by_color_grey(self):
         qs = self._filter(data={'color': '#f6f6f6'})
         filter_ = qs['query']['bool']['filter']
@@ -1041,6 +1097,24 @@ class TestSearchParameterFilter(FilterTestsBase):
             {'range': {'colors.l': {'gte': 0, 'lte': 115}}},
             {'range': {'colors.ratio': {'gte': 0.25}}},
         ]
+
+    def test_search_by_color_empty(self):
+        qs = self._filter(data={'color': ''})
+        # No filtering to apply.
+        assert not qs
+
+    def test_search_by_color_invalid(self):
+        with self.assertRaises(serializers.ValidationError) as context:
+            self._filter(data={'color': '#gggggg'})
+        assert context.exception.detail == ['Invalid "color" parameter.']
+
+        with self.assertRaises(serializers.ValidationError) as context:
+            self._filter(data={'color': '#$(@#*)'})
+        assert context.exception.detail == ['Invalid "color" parameter.']
+
+        with self.assertRaises(serializers.ValidationError) as context:
+            self._filter(data={'color': ' '})
+        assert context.exception.detail == ['Invalid "color" parameter.']
 
     def test_search_by_color_luminosity_extremes(self):
         qs = self._filter(data={'color': '080603'})
@@ -1154,8 +1228,7 @@ class TestCombinedFilter(FilterTestsBase):
         should = bool_['must'][0]['function_score']['query']['bool']['should']
         expected = {
             'multi_match': {
-                '_name': 'MultiMatch(name_l10n_en-us,name_l10n_en-ca,'
-                'name_l10n_en-gb)',
+                '_name': 'MultiMatch(name_l10n_en-us,name_l10n_en-ca,name_l10n_en-gb)',
                 'analyzer': 'english',
                 'boost': 5.0,
                 'fields': ['name_l10n_en-us', 'name_l10n_en-ca', 'name_l10n_en-gb'],
@@ -1185,7 +1258,7 @@ class TestCombinedFilter(FilterTestsBase):
 
     @freeze_time('2023-12-24')
     def test_filter_promoted_sort_random(self):
-        qs = self._filter(data={'promoted': 'verified', 'sort': 'random'})
+        qs = self._filter(data={'promoted': 'spotlight', 'sort': 'random'})
         bool_ = qs['query']['bool']
 
         assert 'must_not' not in bool_

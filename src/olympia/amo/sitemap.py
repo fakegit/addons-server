@@ -20,7 +20,7 @@ from olympia.amo.templatetags.jinja_helpers import absolutify
 from olympia.amo.utils import id_to_path
 from olympia.bandwagon.models import Collection
 from olympia.constants.categories import CATEGORIES
-from olympia.constants.promoted import RECOMMENDED
+from olympia.constants.promoted import PROMOTED_GROUP_CHOICES
 from olympia.promoted.models import PromotedAddon
 from olympia.tags.models import AddonTag, Tag
 from olympia.users.models import UserProfile
@@ -35,7 +35,7 @@ FRONTEND_LANGUAGES = [
     'de',
     'en-GB',
     'en-US',
-    'es',
+    'es-ES',
     'fr',
     'ja',
     'pl',
@@ -135,9 +135,9 @@ class Sitemap(DjangoSitemap):
 def get_android_promoted_addons():
     return PromotedAddon.objects.filter(
         Q(application_id=amo.ANDROID.id) | Q(application_id__isnull=True),
-        group_id=RECOMMENDED.id,
+        group_id=PROMOTED_GROUP_CHOICES.RECOMMENDED,
         addon___current_version__promoted_approvals__application_id=(amo.ANDROID.id),
-        addon___current_version__promoted_approvals__group_id=RECOMMENDED.id,
+        addon___current_version__promoted_approvals__group_id=PROMOTED_GROUP_CHOICES.RECOMMENDED,
     )
 
 
@@ -479,8 +479,8 @@ def get_sitemap_path(section, app, page=1):
             raise InvalidSection
         try:
             page = int(page)
-        except ValueError:
-            raise PageNotAnInteger
+        except ValueError as exc:
+            raise PageNotAnInteger from exc
         if app is None:
             # If we don't have a section or app, we don't need a complex directory
             # structure and we can call the first page 'sitemap' for convenience

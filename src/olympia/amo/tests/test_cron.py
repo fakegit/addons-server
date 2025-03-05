@@ -1,5 +1,4 @@
 import os
-import subprocess
 from unittest import mock
 
 from django.conf import settings
@@ -13,7 +12,7 @@ from olympia.amo.models import FakeEmail
 from olympia.amo.sitemap import get_sitemaps
 from olympia.amo.tests import TestCase, addon_factory, user_factory, version_factory
 from olympia.constants.activity import RETENTION_DAYS
-from olympia.constants.promoted import RECOMMENDED
+from olympia.constants.promoted import PROMOTED_GROUP_CHOICES
 from olympia.constants.scanners import YARA
 from olympia.files.models import FileUpload
 from olympia.scanners.models import ScannerResult
@@ -230,7 +229,7 @@ class TestWriteSitemaps(TestCase):
         addon_factory()
         TestCase.make_addon_promoted(
             addon_factory(version_kw={'application': amo.ANDROID.id}),
-            RECOMMENDED,
+            PROMOTED_GROUP_CHOICES.RECOMMENDED,
             approve_version=True,
         )
         assert len(os.listdir(settings.SITEMAP_STORAGE_PATH)) == 0
@@ -315,18 +314,3 @@ class TestWriteSitemaps(TestCase):
         assert os.path.exists(os.path.join(sitemaps_dir, 'addons/android/1/01/1.xml'))
         assert os.path.exists(os.path.join(sitemaps_dir, 'users/android/1/01/1.xml'))
         assert os.path.exists(os.path.join(sitemaps_dir, 'tags/android/1/01/1.xml'))
-
-
-def test_gen_cron():
-    args = [
-        'scripts/crontab/gen-cron.py',
-        '-z ./',
-        '-u root',
-    ]
-    output = subprocess.check_output(args)
-
-    assert b'MAILTO=amo-crons@mozilla.com' in output
-    # check some known jobs are rendered as expected in the output
-    prefix = b'root cd  ./; /usr/bin/python -W ignore::DeprecationWarning manage.py'
-    assert (b'*/5 * * * * %s auto_approve' % prefix) in output
-    assert (b'10 * * * * %s cron update_blog_posts' % prefix) in output

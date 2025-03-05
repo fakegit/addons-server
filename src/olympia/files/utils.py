@@ -181,8 +181,10 @@ class ManifestJSONExtractor:
             self.data = json.loads(json_string)
             if not isinstance(self.data, dict):
                 raise TypeError()
-        except Exception:
-            raise InvalidManifest(gettext('Could not parse the manifest file.'))
+        except Exception as exc:
+            raise InvalidManifest(
+                gettext('Could not parse the manifest file.')
+            ) from exc
 
     def get(self, key, default=None):
         return self.data.get(key, default)
@@ -280,11 +282,7 @@ class ManifestJSONExtractor:
             # WebExt dicts are only compatible with Firefox desktop >= 61.
             apps = ((amo.FIREFOX, amo.DEFAULT_WEBEXT_DICT_MIN_VERSION_FIREFOX),)
         else:
-            webext_min_firefox = (
-                amo.DEFAULT_WEBEXT_MIN_VERSION
-                if self.get('browser_specific_settings', None) is None
-                else amo.DEFAULT_WEBEXT_MIN_VERSION_BROWSER_SPECIFIC
-            )
+            webext_min_firefox = amo.DEFAULT_WEBEXT_MIN_VERSION
             webext_min_android = (
                 amo.DEFAULT_WEBEXT_MIN_VERSION_GECKO_ANDROID
                 if self.gecko_android is not EMPTY_FALLBACK_DICT
@@ -310,17 +308,6 @@ class ManifestJSONExtractor:
             key='min', application=amo.FIREFOX
         )
 
-        doesnt_support_no_id = (
-            strict_min_version_firefox
-            and strict_min_version_firefox
-            < VersionString(amo.DEFAULT_WEBEXT_MIN_VERSION_NO_ID)
-        )
-
-        if self.guid is None and doesnt_support_no_id:
-            raise forms.ValidationError(
-                gettext('Add-on ID is required for Firefox 47 and below.')
-            )
-
         # If a minimum strict version is specified, it needs to be higher
         # than the version when Firefox started supporting WebExtensions.
         unsupported_no_matter_what = (
@@ -329,25 +316,21 @@ class ManifestJSONExtractor:
             < VersionString(amo.DEFAULT_WEBEXT_MIN_VERSION)
         )
         if unsupported_no_matter_what:
-            msg = gettext('Lowest supported "strict_min_version" is 42.0.')
-            raise forms.ValidationError(msg)
+            msg = gettext('Lowest supported "strict_min_version" is {min_version}.')
+            raise forms.ValidationError(
+                msg.format(min_version=amo.DEFAULT_WEBEXT_MIN_VERSION)
+            )
 
         for app, default_min_version in apps:
             strict_min_version_from_manifest = self.get_strict_version_for(
                 key='min', application=app
             )
-            strict_min_version = strict_min_version_from_manifest
-            if self.guid is None and not strict_min_version:
-                strict_min_version = max(
-                    VersionString(amo.DEFAULT_WEBEXT_MIN_VERSION_NO_ID),
-                    VersionString(default_min_version),
-                )
-            else:
-                # strict_min_version for this app shouldn't be lower than the
-                # default min version for this app.
-                strict_min_version = max(
-                    strict_min_version, VersionString(default_min_version)
-                )
+
+            # strict_min_version for this app shouldn't be lower than the
+            # default min version for this app.
+            strict_min_version = max(
+                strict_min_version_from_manifest, VersionString(default_min_version)
+            )
 
             strict_max_version_from_manifest = self.get_strict_version_for(
                 key='max', application=app
@@ -362,17 +345,17 @@ class ManifestJSONExtractor:
             qs = AppVersion.objects.filter(application=app.id)
             try:
                 min_appver = qs.get(version=strict_min_version)
-            except AppVersion.DoesNotExist:
+            except AppVersion.DoesNotExist as exc:
                 msg = gettext(
                     'Unknown "strict_min_version" {appver} for {app}'.format(
                         app=app.pretty, appver=strict_min_version
                     )
                 )
-                raise forms.ValidationError(msg)
+                raise forms.ValidationError(msg) from exc
 
             try:
                 max_appver = qs.get(version=strict_max_version)
-            except AppVersion.DoesNotExist:
+            except AppVersion.DoesNotExist as exc:
                 # If the specified strict_max_version can't be found, raise an
                 # error: we used to use '*' instead but this caused more
                 # problems, especially with langpacks that are really specific
@@ -382,7 +365,7 @@ class ManifestJSONExtractor:
                         app=app.pretty, appver=strict_max_version
                     )
                 )
-                raise forms.ValidationError(msg)
+                raise forms.ValidationError(msg) from exc
 
             if app == amo.ANDROID and self.gecko_android is not EMPTY_FALLBACK_DICT:
                 originated_from = amo.APPVERSIONS_ORIGINATED_FROM_MANIFEST_GECKO_ANDROID
@@ -408,11 +391,13 @@ class ManifestJSONExtractor:
             dictionaries = self.get('dictionaries', EMPTY_FALLBACK_DICT)
             key = force_str(list(dictionaries.keys())[0])
             return key[:255]
-        except (IndexError, UnicodeDecodeError):
+        except (IndexError, UnicodeDecodeError) as exc:
             # This shouldn't happen: the linter should prevent it, but
             # just in case, handle the error (without bothering with
             # translations as users should never see this).
-            raise forms.ValidationError('Invalid dictionaries object or langpack_id.')
+            raise forms.ValidationError(
+                'Invalid dictionaries object or langpack_id.'
+            ) from exc
 
     def parse(self, minimal=False):
         data = {
@@ -561,7 +546,7 @@ def archive_member_validator(member, ignore_filename_errors=False):
 
     try:
         force_str(filename)
-    except UnicodeDecodeError:
+    except UnicodeDecodeError as exc:
         # We can't log the filename unfortunately since it's encoding
         # is obviously broken :-/
         log.warning('Extraction error, invalid file name encoding')
@@ -569,7 +554,7 @@ def archive_member_validator(member, ignore_filename_errors=False):
             'Invalid file name in archive. Please make sure '
             'all filenames are utf-8 or latin1 encoded.'
         )
-        raise InvalidArchiveFile(msg)
+        raise InvalidArchiveFile(msg) from exc
 
     if not ignore_filename_errors:
         if (
@@ -659,22 +644,6 @@ class SafeZip:
                 if (name, {'rsa': 'sf', 'sf': 'rsa'}[ext]) in finds:
                     return True
                 finds.append((name, ext))
-
-    def extract_from_manifest(self, manifest):
-        """
-        Extracts a file given a manifest such as:
-            jar:chrome/de.jar!/locale/de/browser/
-        or
-            locale/de/browser
-        """
-        type, path = manifest.split(':')
-        jar = self
-        if type == 'jar':
-            parts = path.split('!')
-            for part in parts[:-1]:
-                jar = self.__class__(io.BytesIO(jar.zip_file.read(part)))
-            path = parts[-1]
-        return jar.read(path[1:] if path.startswith('/') else path)
 
     def extract_info_to_dest(self, info, dest):
         """Extracts the given info to a directory and checks the file size."""
@@ -768,17 +737,22 @@ def extract_extension_to_dest(source, dest=None, force_fsync=False):
                 archive.extractall(target)
         else:
             raise FileNotFoundError  # Unsupported file, shouldn't be reached
-    except (zipfile.BadZipFile, tarfile.ReadError, OSError, forms.ValidationError) as e:
+    except (
+        zipfile.BadZipFile,
+        tarfile.ReadError,
+        OSError,
+        forms.ValidationError,
+    ) as exc:
         if tempdir is not None:
             rm_local_tmp_dir(tempdir)
-        if isinstance(e, (FileNotFoundError, forms.ValidationError)):
+        if isinstance(exc, (FileNotFoundError, forms.ValidationError)):
             # We let FileNotFoundError (which are a subclass of IOError, or
             # rather OSError but that's an alias) and ValidationError be
             # raised, the caller will have to deal with it.
             raise
         # Any other exceptions we caught, we raise a generic ValidationError
         # instead.
-        raise forms.ValidationError(gettext('Invalid or broken archive.'))
+        raise forms.ValidationError(gettext('Invalid or broken archive.')) from exc
     return target
 
 
@@ -847,7 +821,9 @@ def extract_xpi(xpi, path):
     return all_files
 
 
-def parse_xpi(xpi, addon=None, minimal=False, user=None):
+def parse_xpi(
+    xpi, *, addon=None, minimal=False, user=None, bypass_trademark_checks=False
+):
     """Extract and parse an XPI. Returns a dict with various
     properties describing the xpi.
 
@@ -877,21 +853,31 @@ def parse_xpi(xpi, addon=None, minimal=False, user=None):
 
     except forms.ValidationError:
         raise
-    except zipfile.BadZipFile:
-        raise forms.ValidationError(gettext('Invalid or corrupted file.'))
-    except Exception as exception:
+    except zipfile.BadZipFile as exc:
+        raise forms.ValidationError(gettext('Invalid or corrupted file.')) from exc
+    except Exception as exc:
         # We don't really know what happened, so even though we return a
         # generic message about the manifest, don't raise InvalidManifest: it's
         # not just invalid, it's worse... We want the validation to stop there.
-        log.exception(f'XPI parse error ({exception.__class__})')
-        raise forms.ValidationError(gettext('Could not parse the manifest file.'))
+        log.exception(f'XPI parse error ({exc.__class__})')
+        raise forms.ValidationError(
+            gettext('Could not parse the manifest file.')
+        ) from exc
 
     if minimal:
         return xpi_info
-    return check_xpi_info(xpi_info, addon, xpi, user=user)
+    return check_xpi_info(
+        xpi_info,
+        addon=addon,
+        xpi_file=xpi,
+        user=user,
+        bypass_trademark_checks=bypass_trademark_checks,
+    )
 
 
-def check_xpi_info(xpi_info, addon=None, xpi_file=None, user=None):
+def check_xpi_info(
+    xpi_info, *, addon=None, xpi_file=None, user=None, bypass_trademark_checks=False
+):
     from olympia.addons.models import Addon, DeniedGuid
     from olympia.versions.models import Version
 
@@ -942,7 +928,7 @@ def check_xpi_info(xpi_info, addon=None, xpi_file=None, user=None):
                 )
             )
 
-    if xpi_file:
+    if not bypass_trademark_checks and xpi_file:
         # Make sure we pass in a copy of `xpi_info` since
         # `resolve_webext_translations` modifies data in-place
         translations = Addon.resolve_webext_translations(xpi_info.copy(), xpi_file)
@@ -979,7 +965,9 @@ def check_xpi_info(xpi_info, addon=None, xpi_file=None, user=None):
     return xpi_info
 
 
-def parse_addon(pkg, addon=None, user=None, minimal=False):
+def parse_addon(
+    pkg, *, addon=None, user=None, minimal=False, bypass_trademark_checks=False
+):
     """
     Extract and parse a file path, UploadedFile or FileUpload. Returns a dict
     with various properties describing the add-on.
@@ -997,10 +985,20 @@ def parse_addon(pkg, addon=None, user=None, minimal=False):
     json) and returns only the minimal set of properties needed to decide
     what to do with the add-on (the exact set depends on the add-on type, but
     it should always contain at least guid, type and version.
+
+    If `bypass_trademark_checks` is False, trademark checks are bypassed. It
+    can be useful when parsing existing add-ons that may have been created
+    before trademark validation went into effect.
     """
     name = getattr(pkg, 'name', pkg)
     if name.endswith(amo.VALID_ADDON_FILE_EXTENSIONS):
-        parsed = parse_xpi(pkg, addon, minimal=minimal, user=user)
+        parsed = parse_xpi(
+            pkg,
+            addon=addon,
+            minimal=minimal,
+            user=user,
+            bypass_trademark_checks=bypass_trademark_checks,
+        )
     else:
         valid_extensions_string = '(%s)' % ', '.join(amo.VALID_ADDON_FILE_EXTENSIONS)
         raise UnsupportedFileType(
@@ -1021,7 +1019,13 @@ def parse_addon(pkg, addon=None, user=None, minimal=False):
             msg = gettext(
                 'The type (%s) does not match the type of your add-on on AMO (%s)'
             )
-            raise forms.ValidationError(msg % (parsed['type'], addon.type))
+            raise forms.ValidationError(
+                msg
+                % (
+                    amo.ADDON_TYPE.get(parsed['type'], gettext('Unknown')),
+                    addon.get_type_display(),
+                )
+            )
     return parsed
 
 
@@ -1039,25 +1043,6 @@ def get_sha256(file_obj):
     for chunk in iterator:
         hash_.update(chunk)
     return hash_.hexdigest()
-
-
-def update_version_number(file_obj, new_version_number):
-    """Update the manifest to have the new version number."""
-    # Create a new xpi with the updated version.
-    updated = f'{file_obj.file.path}.updated_version_number'
-    # Copy the original XPI, with the updated manifest.json.
-    with zipfile.ZipFile(file_obj.file.path, 'r') as source:
-        file_list = source.infolist()
-        with zipfile.ZipFile(updated, 'w', zipfile.ZIP_DEFLATED) as dest:
-            for file_ in file_list:
-                content = source.read(file_.filename)
-                if file_.filename == 'manifest.json':
-                    content = _update_version_in_json_manifest(
-                        content, new_version_number
-                    )
-                dest.writestr(file_, content)
-    # Move the updated file to the original file.
-    os.replace(updated, file_obj.file.path)
 
 
 class InvalidOrUnsupportedCrx(Exception):
@@ -1104,8 +1089,8 @@ def write_crx_as_xpi(chunks, target):
                 start_position = 12 + header_length
             else:
                 raise InvalidOrUnsupportedCrx('Unsupported CRX version')
-        except struct.error:
-            raise InvalidOrUnsupportedCrx('Invalid or corrupt CRX file')
+        except struct.error as exc:
+            raise InvalidOrUnsupportedCrx('Invalid or corrupt CRX file') from exc
 
         # We can start reading the zip to write it where it needs to live on
         # the filesystem and then return the hash to the caller. If we somehow
@@ -1123,14 +1108,6 @@ def write_crx_as_xpi(chunks, target):
                 data = tmp.read(65536)
 
     return hash_value
-
-
-def _update_version_in_json_manifest(content, new_version_number):
-    """Change the version number in the json manifest file provided."""
-    updated = json.loads(content)
-    if 'version' in updated:
-        updated['version'] = new_version_number
-    return json.dumps(updated)
 
 
 def extract_translations(file_obj):

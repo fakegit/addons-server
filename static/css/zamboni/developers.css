@@ -147,7 +147,7 @@ form .char-count {
     font-size: 0.9em;
 }
 form .edit-addon-details .char-count,
-form .edit-addon-details .html-support {
+form .edit-addon-details .syntax-support {
     font-size: 1em;
 }
 
@@ -702,6 +702,8 @@ div.history-container {
 div.review-entry {
     padding: 0.5em 1em;
     margin-bottom: 0.25em;
+    display: flex;
+    justify-content: space-between;
 }
 
 div.review-entry.new {
@@ -1505,6 +1507,39 @@ form.select-review .errorlist {
     font-style: normal;
     margin: 0;
     margin-bottom: 10px;
+}
+
+.verify-email-actions {
+    margin-top: 10px;
+}
+
+.verify-email-button {
+    margin-top: 10px;
+}
+
+.verify-email-table {
+    margin: 20px 0;
+    width: 100%;
+}
+
+.verify-email-table table {
+    border-collapse: collapse;
+    border: 1px solid;
+    width: 100%;
+}
+
+.verify-email-table tr {
+    border: solid;
+    border-width: 1px 0;
+}
+
+.verify-email-table td {
+    padding: 5px;
+    border: solid;
+    border-width: 0 1px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 button.search-button {

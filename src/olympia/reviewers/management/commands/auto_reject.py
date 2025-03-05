@@ -6,10 +6,13 @@ from django.db import transaction
 
 import olympia.core.logger
 from olympia import amo
+from olympia.abuse.models import CinderJob
+from olympia.activity.models import ActivityLog
 from olympia.addons.models import Addon
 from olympia.amo.decorators import use_primary_db
 from olympia.files.utils import lock
 from olympia.reviewers.models import (
+    ReviewActionReason,
     clear_reviewing_cache,
     get_reviewing_cache,
     set_reviewing_cache,
@@ -56,7 +59,6 @@ class Command(BaseCommand):
             .order_by('id')
         )
 
-    @transaction.atomic
     def reject_versions(self, *, addon, versions, latest_version):
         """Reject specific versions for an addon."""
         if self.dry_run:
@@ -67,11 +69,28 @@ class Command(BaseCommand):
             )
             return
         helper = ReviewHelper(addon=addon, version=latest_version, human_review=False)
+        relevant_activity_logs = ActivityLog.objects.for_versions(versions).filter(
+            action__in=(
+                amo.LOG.REJECT_CONTENT_DELAYED.id,
+                amo.LOG.REJECT_VERSION_DELAYED.id,
+            )
+        )
+        log_details = getattr(relevant_activity_logs.first(), 'details', {})
+        cinder_jobs = CinderJob.objects.filter(
+            pending_rejections__version__in=versions
+        ).distinct()
         helper.handler.data = {
-            'comments': 'Automatic rejection after grace period ended.',
+            'comments': log_details.get('comments', ''),
+            'cinder_jobs_to_resolve': cinder_jobs,
+            'reasons': ReviewActionReason.objects.filter(
+                reviewactionreasonlog__activity_log__in=relevant_activity_logs
+            ).distinct(),
             'versions': versions,
         }
-        helper.handler.reject_multiple_versions()
+        helper.handler.review_action = {
+            'allows_reasons': True,
+        }
+        helper.handler.auto_reject_multiple_versions()
         VersionReviewerFlags.objects.filter(version__in=list(versions)).update(
             pending_rejection=None,
             pending_rejection_by=None,
@@ -79,43 +98,46 @@ class Command(BaseCommand):
         )
 
     def process_addon(self, *, addon, now):
-        latest_version = addon.find_latest_version(channel=amo.CHANNEL_LISTED)
-        if (
-            latest_version
-            and latest_version.is_unreviewed
-            and not latest_version.pending_rejection
-        ):
-            # If latest version is unreviewed and not pending
-            # rejection, we want to put the delayed rejection of all
-            # versions of this addon on hold until a decision has been
-            # made by reviewers on the latest one.
-            log.info(
-                'Skipping rejections for add-on %s until version %s '
-                'has been reviewed',
-                addon.pk,
-                latest_version.pk,
-            )
-            return
-        versions = self.fetch_version_candidates_for_addon(addon=addon, now=now)
-        if not versions.exists():
-            log.info('Somehow no versions to auto-reject for add-on %s', addon.pk)
-            return
-        locked_by = get_reviewing_cache(addon.pk)
-        if locked_by:
-            # Don't auto-reject something that has been locked, even by the
-            # task user - wait until it's free to avoid any conflicts.
-            log.info(
-                'Skipping rejections for add-on %s until lock from user %s '
-                'has expired',
-                addon.pk,
-                locked_by,
-            )
-            return
-        set_reviewing_cache(addon.pk, settings.TASK_USER_ID)
         try:
-            self.reject_versions(
-                addon=addon, versions=versions, latest_version=latest_version
-            )
+            with transaction.atomic():
+                latest_version = addon.find_latest_version(channel=amo.CHANNEL_LISTED)
+                if (
+                    latest_version
+                    and latest_version.is_unreviewed
+                    and not latest_version.pending_rejection
+                ):
+                    # If latest version is unreviewed and not pending
+                    # rejection, we want to put the delayed rejection of all
+                    # versions of this addon on hold until a decision has been
+                    # made by reviewers on the latest one.
+                    log.info(
+                        'Skipping rejections for add-on %s until version %s '
+                        'has been reviewed',
+                        addon.pk,
+                        latest_version.pk,
+                    )
+                    return
+                versions = self.fetch_version_candidates_for_addon(addon=addon, now=now)
+                if not versions.exists():
+                    log.info(
+                        'Somehow no versions to auto-reject for add-on %s', addon.pk
+                    )
+                    return
+                locked_by = get_reviewing_cache(addon.pk)
+                if locked_by:
+                    # Don't auto-reject something that has been locked, even by the
+                    # task user - wait until it's free to avoid any conflicts.
+                    log.info(
+                        'Skipping rejections for add-on %s until lock from user %s '
+                        'has expired',
+                        addon.pk,
+                        locked_by,
+                    )
+                    return
+                set_reviewing_cache(addon.pk, settings.TASK_USER_ID)
+                self.reject_versions(
+                    addon=addon, versions=versions, latest_version=latest_version
+                )
         finally:
             # Always clear our lock no matter what happens.
             clear_reviewing_cache(addon.pk)

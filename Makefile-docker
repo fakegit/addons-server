@@ -8,150 +8,64 @@ export PYTHON_COMMAND=python3
 export PIP_COMMAND=$(PYTHON_COMMAND) -m pip
 APP=src/olympia/
 
-NUM_ADDONS=10
-NUM_THEMES=$(NUM_ADDONS)
-
-NPM_ARGS :=
-
-ifneq ($(NPM_CONFIG_PREFIX),)
-	NPM_ARGS := --prefix $(NPM_CONFIG_PREFIX)
+# Build list of dependencies to install
+DEPS = pip prod
+# If we're running a development image, then we should install the development dependencies
+ifeq ($(OLYMPIA_DEPS), development)
+DEPS += dev
 endif
-
-NODE_MODULES := $(NPM_CONFIG_PREFIX)node_modules/
-STATIC_CSS := static/css/node_lib/
-STATIC_JS := static/js/node_lib/
-STATIC_JQUERY_UI := static/js/node_lib/ui/
-
-NODE_LIBS_CSS := \
-@claviska/jquery-minicolors/jquery.minicolors.css \
-@claviska/jquery-minicolors/jquery.minicolors.png \
-
-# NODE_LIBS_JS and NODE_LIBS_JQUERY_UI are referenced in settings.MINIFY_BUNDLES - keep both lists in sync
-NODE_LIBS_JS := \
-less/dist/less.js \
-jquery/dist/jquery.js \
-jquery.browser/dist/jquery.browser.js \
-jquery.cookie/jquery.cookie.js \
-@claviska/jquery-minicolors/jquery.minicolors.js \
-jszip/dist/jszip.js \
-timeago/jquery.timeago.js \
-underscore/underscore.js \
-netmask/lib/netmask.js \
-
-NODE_LIBS_JQUERY_UI := \
-jquery-ui/ui/data.js \
-jquery-ui/ui/scroll-parent.js \
-jquery-ui/ui/widget.js \
-jquery-ui/ui/widgets/mouse.js \
-jquery-ui/ui/widgets/sortable.js
 
 .PHONY: help_redirect
 help_redirect:
 	@$(MAKE) help --no-print-directory
 
-.PHONY: initialize_db
-initialize_db: ## create a new database
-	rm -rf ./user-media/* ./tmp/*
-	$(PYTHON_COMMAND) manage.py create_db --force
-	$(PYTHON_COMMAND) manage.py migrate --noinput
-	$(PYTHON_COMMAND) manage.py loaddata initial.json
-	$(PYTHON_COMMAND) manage.py import_prod_versions
-	$(PYTHON_COMMAND) manage.py createsuperuser
-	$(PYTHON_COMMAND) manage.py loaddata zadmin/users
+.PHONY: check_debian_packages
+check_debian_packages: ## check the existence of multiple debian packages
+	./scripts/check_debian_packages.sh
 
-.PHONY: populate_data
-populate_data: ## populate a new database
-	# reindex --wipe will force the ES mapping to be re-installed. Useful to
-	# make sure the mapping is correct before adding a bunch of add-ons.
-	$(PYTHON_COMMAND) manage.py reindex --wipe --force --noinput
-	$(PYTHON_COMMAND) manage.py generate_addons --app firefox $(NUM_ADDONS)
-	$(PYTHON_COMMAND) manage.py generate_addons --app android $(NUM_ADDONS)
-	$(PYTHON_COMMAND) manage.py generate_themes $(NUM_THEMES)
-	# These add-ons are specifically useful for the addons-frontend
-	# homepage. You may have to re-run this, in case the data there
-	# changes.
-	$(PYTHON_COMMAND) manage.py generate_default_addons_for_frontend
+.PHONY: check_pip_packages
+check_pip_packages: ## check the existence of multiple python packages
+	@for dep in $(DEPS); do \
+		./scripts/check_pip_packages.sh $$dep.txt; \
+	done
 
-	# Now that addons have been generated, reindex.
-	$(PYTHON_COMMAND) manage.py reindex --force --noinput
+.PHONY: check_django
+check_django: ## check if the django app is configured properly
+	./manage.py check
 
-.PHONY: update_deps_base
-update_deps_base: ## update the python and node dependencies
-	# Work arounds "Multiple .dist-info directories" issue.
-	rm -rf /deps/build/*
-	# pep 517 mode (the default) breaks editable install in our project. https://github.com/mozilla/addons-server/issues/16144
-	$(PIP_COMMAND) install --no-use-pep517 -e .
-	$(PIP_COMMAND) install --progress-bar=off --no-deps --exists-action=w -r requirements/pip.txt
-	$(PIP_COMMAND) install --progress-bar=off --no-deps --exists-action=w -r requirements/prod.txt
+.PHONY: check
+check: check_debian_packages check_pip_packages check_django
 
-	npm install $(NPM_ARGS)
-	for dest in $(NODE_LIBS_CSS) ; do cp $(NODE_MODULES)$$dest $(STATIC_CSS) ; done
-	for dest in $(NODE_LIBS_JS) ; do cp $(NODE_MODULES)$$dest $(STATIC_JS) ; done
-	for dest in $(NODE_LIBS_JQUERY_UI) ; do cp $(NODE_MODULES)$$dest $(STATIC_JQUERY_UI) ; done
+.PHONY: data_dump
+data_dump:
+	./manage.py data_dump $(ARGS)
 
-.PHONY: update_deps
-update_deps: update_deps_base ## update the python and node dependencies for development
-	$(PIP_COMMAND) install --progress-bar=off --no-deps --exists-action=w -r requirements/dev.txt
-
-.PHONY: update_deps_prod
-update_deps_prod: update_deps_base ## update the python and node dependencies for production
-	npm prune --omit=dev
-
-.PHONY: update_db
-update_db: ## run the database migrations
-	$(PYTHON_COMMAND) manage.py migrate --noinput
+.PHONY: data_load
+data_load:
+	./manage.py data_load $(ARGS)
 
 .PHONY: update_assets
-update_assets:
-	# If changing this here, make sure to adapt tests in amo/test_commands.py
-	$(PYTHON_COMMAND) manage.py compress_assets
-	$(PYTHON_COMMAND) manage.py collectstatic --noinput
-	$(PYTHON_COMMAND) manage.py generate_jsi18n_files
+update_assets: ## Update the static assets
+	$(HOME)/scripts/update_assets.py
 
-.PHONY: update
-update: update_deps update_db update_assets ## update the dependencies, the database, and assets
+.PHONY: run_vite
+run_vite:
+	npm run $(NPM_ARGS) dev
 
-.PHONY: reindex
-reindex: ## reindex everything in elasticsearch, for AMO
-	$(PYTHON_COMMAND) manage.py reindex $(ARGS)
+.PHONY: update_deps
+update_deps: ## Update the dependencies
+	$(HOME)/scripts/install_deps.py $(DEPS)
 
+# TOOD: remove this after we migrate addons-frontned to not depend on it.
 .PHONY: setup-ui-tests
 setup-ui-tests:
-	rm -rf ./user-media/* ./tmp/*
-	# Reset the database and fake database migrations
-	$(PYTHON_COMMAND) manage.py create_db --force
-	$(PYTHON_COMMAND) manage.py migrate --noinput
-
-	# Reindex
-	$(PYTHON_COMMAND) manage.py reindex --force --noinput --wipe
-
-	# Let's load some initial data and import mozilla-product versions
-	$(PYTHON_COMMAND) manage.py loaddata initial.json
-	$(PYTHON_COMMAND) manage.py loaddata zadmin/users
-	$(PYTHON_COMMAND) manage.py loaddata src/olympia/access/fixtures/initial.json
-	$(PYTHON_COMMAND) manage.py import_prod_versions
-
-	# Create a proper superuser that can be used to access the API
-	$(PYTHON_COMMAND) manage.py waffle_switch super-create-accounts on --create
-	$(PYTHON_COMMAND) manage.py waffle_switch activate-autograph-signing on --create
-	$(PYTHON_COMMAND) manage.py generate_addons --app firefox $(NUM_ADDONS)
-	$(PYTHON_COMMAND) manage.py generate_addons --app android $(NUM_ADDONS)
-	$(PYTHON_COMMAND) manage.py generate_themes $(NUM_THEMES)
-	$(PYTHON_COMMAND) manage.py generate_default_addons_for_frontend
-
-	# Now that addons have been generated, reindex.
-	$(PYTHON_COMMAND) manage.py reindex --force --noinput
-
-.PHONY: perf-tests
-perf-tests: setup-ui-tests
-	$(PIP_COMMAND) install --progress-bar=off --no-deps -r requirements/perftests.txt
-	locust --no-web -c 1 -f tests/performance/locustfile.py --host "http://olympia.test"
+	@echo "This is a deprecated target, please stop using it."
 
 .PHONY: lint
 lint: ## lint the code
 	ruff check .
 	ruff format --check .
-	NODE_PATH=$(NODE_MODULES) npm exec $(NPM_ARGS) -- prettier --check '**'
+	npm exec $(NPM_ARGS) -- prettier --check '**'
 	curlylint src/
 
 lint-codestyle: lint
@@ -159,10 +73,6 @@ lint-codestyle: lint
 .PHONY: docs
 docs: ## build the documentation
 	$(MAKE) -C docs html SPHINXOPTS='-nW'
-
-.PHONY: debug
-debug: ## connect for debugging
-	supervisorctl fg olympia
 
 .PHONY: djshell
 djshell: ## connect to django shell
@@ -173,55 +83,113 @@ dbshell: ## connect to a database shell
 	$(PYTHON_COMMAND) ./manage.py dbshell
 
 .PHONY: initialize
-initialize: update_deps initialize_db update_assets populate_data ## init the dependencies, the database, and assets
+initialize: ## ensure database exists
+	@echo "Initializing data..."
+	@echo "args: $(ARGS)"
+	$(PYTHON_COMMAND) ./manage.py initialize $(ARGS)
 
-.PHONY: reload
-reload: ## force django code reload
-	uwsgi --reload ${HOME}/docker/artifacts/addons-server-uwsgi-master.pid
+PYTEST_SRC := src/olympia/
 
-reload-uwsgi: reload
+.PHONY: test_needs_locales_compilation
+test_needs_locales_compilation:
+	pytest $(PYTEST_SRC) \
+		-m 'needs_locales_compilation' \
+		$(ARGS)
+
+.PHONY: test_static_assets
+test_static_assets: run_js_tests
+	pytest $(PYTEST_SRC) \
+		-m 'static_assets' \
+		$(ARGS)
+
+.PHONY: test_main
+test_main:
+	pytest $(PYTEST_SRC) \
+		-n auto \
+		-m 'not es_tests and not needs_locales_compilation and not static_assets and not internal_routes_allowed' \
+		$(ARGS)
+
+.PHONY: test_internal_routes_allowed
+test_internal_routes_allowed:
+# We need to change the setting in the file because we can't
+# override an env variable here, and the next command requires
+# `INTERNAL_ROUTES_ALLOWED` to be set to `True`.
+	sed -i 's/^INTERNAL_ROUTES_ALLOWED.*/INTERNAL_ROUTES_ALLOWED=True/' settings_test.py
+	pytest \
+		$(PYTEST_SRC) \
+		-m 'internal_routes_allowed' \
+		$(ARGS)
+
+.PHONY: test_es_tests
+test_es_tests:
+	pytest \
+		$(PYTEST_SRC) \
+		-m 'es_tests and not needs_locales_compilation and not static_assets' \
+		$(ARGS)
 
 .PHONY: test
 test: ## run the entire test suite
-	pytest $(APP) $(ARGS)
+	pytest \
+		$(PYTEST_SRC) \
+		$(ARGS)
 
 .PHONY: test_es
 test_es: ## run the ES tests
-	pytest -m es_tests $(APP) $(ARGS)
+	pytest \
+		$(PYTEST_SRC) \
+		-m es_tests \
+		$(ARGS)
 
 .PHONY: test_no_es
 test_no_es: ## run all but the ES tests
-	pytest -m "not es_tests" $(APP) $(ARGS)
+	pytest \
+		$(PYTEST_SRC) \
+		-m "not es_tests" \
+		$(ARGS)
 
 .PHONY: test_force_db
 test_force_db: ## run the entire test suite with a new database
-	pytest --create-db $(APP) $(ARGS)
+	pytest \
+		$(PYTEST_SRC) \
+		--create-db \
+		$(ARGS)
 
 .PHONY: tdd
 tdd: ## run the entire test suite, but stop on the first error
-	pytest -x --pdb $(ARGS) $(APP)
+	pytest \
+		$(PYTEST_SRC) \
+		-x --pdb \
+		$(ARGS)
 
 .PHONY: test_failed
 test_failed: ## rerun the failed tests from the previous run
-	pytest --lf $(ARGS) $(APP)
+	pytest \
+	$(PYTEST_SRC) \
+	--lf \
+	$(ARGS)
 
 .PHONY: run_js_tests
 run_js_tests: ## Run the JavaScript test suite (requires compiled/compressed assets).
-	NODE_PATH=$(NODE_MODULES) npm exec $(NPM_ARGS) -- jest
+	npm run test tests/js
 
 .PHONY: watch_js_tests
 watch_js_tests: ## Run+watch the JavaScript test suite (requires compiled/compressed assets).
-	NODE_PATH=$(NODE_MODULES) npm exec $(NPM_ARGS) -- jest --watch
+	npm run test:watch tests/js
 
 .PHONY: format
 format: ## Autoformat our codebase.
-	NODE_PATH=$(NODE_MODULES) npm exec $(NPM_ARGS) -- prettier --write '**'
+	npm exec $(NPM_ARGS) -- prettier --write '**'
 	ruff check --fix-only .
 	ruff format .
 
 .PHONY: extract_locales
 extract_locales: ## extracts and merges translation strings
 	./scripts/run_l10n_extraction.sh
+
+.PHONE: compile_locales
+compile_locales: ## compiles translation strings
+	$(PIP_COMMAND) install --progress-bar=off --no-deps -r requirements/locale.txt
+	$(HOME)/scripts/compile_locales.py
 
 .PHONY: help_submake
 help_submake:

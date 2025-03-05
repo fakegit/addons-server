@@ -12,6 +12,10 @@ log = logger.getLogger('z.cron')
 
 
 class Command(BaseCommand):
+    """Cron jobs are defined in
+    https://github.com/mozilla-it/webservices-infra/blob/main/amo/k8s/addons-server/values.yaml
+    """
+
     help = 'Run one of the predefined cron jobs'
 
     def add_arguments(self, parser):
@@ -38,9 +42,7 @@ class Command(BaseCommand):
 
         path = settings.CRON_JOBS.get(name)
         if not path:
-            log.error(
-                'Cron called with an unknown cron job: ' f'{name} {args} {kwargs}'
-            )
+            log.error(f'Cron called with an unknown cron job: {name} {args} {kwargs}')
             raise CommandError(f'Unrecognized job name: {name}')
 
         module = import_module(path)

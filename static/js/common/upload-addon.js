@@ -35,7 +35,8 @@
       filetypes: ['zip', 'xpi', 'crx'],
       getErrors: getErrors,
       cancel: $(),
-      maxSize: 200 * 1024 * 1024, // 200M
+      maxSize: null, // Dynamically set by devhub.js
+      submissionsDisabled: false,
     };
 
     if (options) {
@@ -79,7 +80,9 @@
           text: gettext('Your add-on should end with .zip, .xpi or .crx'),
         });
 
-      $upload_field.prop('disabled', false);
+      ui_link.toggleClass('disabled', settings.submissionsDisabled);
+      $upload_field.prop('disabled', settings.submissionsDisabled);
+
       $upload_field.wrap(ui_parent);
       $upload_field.before(ui_link);
       $upload_field.parent().after(ui_details);
@@ -114,8 +117,8 @@
           // L10n: "{bytes uploaded} of {total filesize}".
           upload_status_progress.text(
             format(gettext('{0} of {1}'), [
-              fileSizeFormat(size),
-              fileSizeFormat(file.size),
+              formatFileSize(size),
+              formatFileSize(file.size),
             ]),
           );
         }
@@ -345,7 +348,7 @@
               errors.push(
                 format(
                   gettext('Your add-on exceeds the maximum size of {0}.'),
-                  [fileSizeFormat(settings.maxSize)],
+                  [formatFileSize(settings.maxSize)],
                 ),
               );
             } else {
@@ -605,9 +608,7 @@
               'UNSAFE_VAR_ASSIGNMENT',
               'MANIFEST_CSP',
             ],
-            mv3NoticeId = '_MV3_COMPATIBILITY',
             checklistMessages = [],
-            mv3CompatibilityMessage,
             // this.id is in the form ["abc_def_ghi', 'foo_bar', 'something'],
             // we usually only match one of the elements.
             matchId = function (id) {
@@ -635,21 +636,6 @@
                   1,
                 );
                 if (!checklistWarningsIds.length) break;
-              }
-
-              // Manifest v3 warning is a custom one added by addons-server
-              // that should be added once, regardless of whether or not we're
-              // displaying the submission warning box.
-              if (_.find([mv3NoticeId], matchId, current)) {
-                let mv3CompatibilityBox = $('<div>')
-                  .attr('class', 'submission-warning')
-                  .appendTo(upload_results);
-                $('<h5>').text(current.message).appendTo(mv3CompatibilityBox);
-                // That description is split into several paragraphs and can
-                // contain HTML for links.
-                current.description.forEach(function (item) {
-                  $('<p>').html(item).appendTo(mv3CompatibilityBox);
-                });
               }
             }
           }

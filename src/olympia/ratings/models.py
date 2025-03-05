@@ -10,7 +10,7 @@ from django.utils.translation import gettext_lazy as _
 import olympia.core.logger
 from olympia import activity, amo, core
 from olympia.amo.fields import PositiveAutoField
-from olympia.amo.models import ManagerBase, ModelBase
+from olympia.amo.models import BaseQuerySet, ManagerBase, ModelBase
 from olympia.amo.templatetags import jinja_helpers
 from olympia.amo.utils import send_mail_jinja
 from olympia.translations.templatetags.jinja_helpers import truncate
@@ -19,7 +19,7 @@ from olympia.translations.templatetags.jinja_helpers import truncate
 log = olympia.core.logger.getLogger('z.ratings')
 
 
-class RatingQuerySet(models.QuerySet):
+class RatingQuerySet(BaseQuerySet):
     """
     A queryset modified for soft deletion.
     """
@@ -48,13 +48,13 @@ class RatingQuerySet(models.QuerySet):
 
     def delete(self):
         pairs = tuple(self.values_list('addon_id', 'user_id'))
-        rval = self.update(deleted=F('id'))
+        rval = self.order_by().update(deleted=F('id'))
         self.update_ratings_and_addons_denormalized_fields(pairs)
         return rval
 
     def undelete(self):
         pairs = tuple(self.values_list('addon_id', 'user_id'))
-        rval = self.update(deleted=0)
+        rval = self.order_by().update(deleted=0)
         self.update_ratings_and_addons_denormalized_fields(pairs)
         return rval
 
@@ -245,9 +245,10 @@ class Rating(ModelBase):
         # because we're not dealing with a creation).
         self.update_denormalized_fields()
 
-    def undelete(self):
+    def undelete(self, *, skip_activity_log=False):
         self.update(deleted=0, _signal=False)
-        activity.log_create(amo.LOG.UNDELETE_RATING, self, self.addon)
+        if not skip_activity_log:
+            activity.log_create(amo.LOG.UNDELETE_RATING, self, self.addon)
         # We're avoiding triggering post_save signal normally because we don't
         # want to record an edit. We trigger the callback manually instead.
         rating_post_save(self.__class__, self, False, **{'undeleted': True})

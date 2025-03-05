@@ -9,7 +9,6 @@ from functools import wraps
 from zipfile import BadZipFile
 
 from django.conf import settings
-from django.core.cache import cache
 from django.core.files.storage import default_storage as storage
 from django.core.validators import ValidationError
 from django.db import transaction
@@ -19,7 +18,6 @@ from django.utils.encoding import force_str
 from django.utils.translation import gettext
 
 import waffle
-from celery.result import AsyncResult
 from django_statsd.clients import statsd
 
 import olympia.core.logger
@@ -67,38 +65,36 @@ def validate(file_, *, final_task=None, theme_specific=False):
     from .utils import Validator
 
     validator = Validator(file_, theme_specific=theme_specific, final_task=final_task)
-
-    task_id = cache.get(validator.cache_key)
-
-    if task_id:
-        return AsyncResult(task_id)
-    else:
-        result = validator.get_task().delay()
-        cache.set(validator.cache_key, result.task_id, 5 * 60)
-        return result
+    task = validator.get_task()
+    return task.delay()
 
 
-def validate_and_submit(addon, file_, *, theme_specific=False):
+def validate_and_submit(*, addon, upload, client_info, theme_specific=False):
     return validate(
-        file_,
+        upload,
         theme_specific=theme_specific,
-        final_task=submit_file.si(addon.pk, file_.pk),
+        final_task=submit_file.si(
+            addon_pk=addon.pk, upload_pk=upload.pk, client_info=client_info
+        ),
     )
 
 
 @task
 @use_primary_db
-def submit_file(addon_pk, upload_pk):
+def submit_file(*, addon_pk, upload_pk, client_info):
     from olympia.devhub.utils import create_version_for_upload
 
     addon = Addon.unfiltered.get(pk=addon_pk)
     upload = FileUpload.objects.get(pk=upload_pk)
     if upload.passed_all_validations:
-        create_version_for_upload(addon, upload, upload.channel)
+        create_version_for_upload(
+            addon=addon, upload=upload, channel=upload.channel, client_info=client_info
+        )
     else:
         log.info(
-            'Skipping version creation for {upload_uuid} that failed '
-            'validation'.format(upload_uuid=upload.uuid)
+            'Skipping version creation for {upload_uuid} that failed validation'.format(
+                upload_uuid=upload.uuid
+            )
         )
 
 
@@ -253,9 +249,7 @@ def validate_file_path(path, channel):
 
     log.info('Running linter on %s', path)
     results = run_addons_linter(path, channel=channel)
-    annotations.annotate_validation_results(
-        results=results, parsed_data=parsed_data, channel=channel
-    )
+    annotations.annotate_validation_results(results=results, parsed_data=parsed_data)
     return json.dumps(results)
 
 
@@ -639,7 +633,6 @@ def send_initial_submission_acknowledgement_email(addon_pk, channel, email, **kw
             text_template,
             context,
             recipient_list=[email],
-            from_email=settings.ADDONS_EMAIL,
             use_deny_list=False,
             perm_setting='individual_contact',
         )
@@ -655,7 +648,6 @@ def send_api_key_revocation_email(emails):
     send_mail(
         subject,
         template.render(context),
-        from_email=settings.ADDONS_EMAIL,
         recipient_list=emails,
         use_deny_list=False,
         perm_setting='individual_contact',

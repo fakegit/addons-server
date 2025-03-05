@@ -177,7 +177,7 @@ class TestCommon(TestCase):
             ('Developer Hub', reverse('devhub.index')),
             ('Manage API Keys', reverse('devhub.api_key')),
         ]
-        check_links(expected, pq(response.content)('#aux-nav .tools a'), verify=False)
+        check_links(expected, pq(response.content)('#aux-nav .tools a'))
 
     def test_tools_developer(self):
         # Make them a developer.
@@ -199,7 +199,7 @@ class TestCommon(TestCase):
             ('Developer Hub', reverse('devhub.index')),
             ('Manage API Keys', reverse('devhub.api_key')),
         ]
-        check_links(expected, pq(response.content)('#aux-nav .tools a'), verify=False)
+        check_links(expected, pq(response.content)('#aux-nav .tools a'))
 
     def test_tools_reviewer(self):
         user = UserProfile.objects.get(email='reviewer@mozilla.com')
@@ -217,7 +217,7 @@ class TestCommon(TestCase):
             ('Manage API Keys', reverse('devhub.api_key')),
             ('Reviewer Tools', reverse('reviewers.dashboard')),
         ]
-        check_links(expected, pq(response.content)('#aux-nav .tools a'), verify=False)
+        check_links(expected, pq(response.content)('#aux-nav .tools a'))
 
     def test_tools_developer_and_reviewer(self):
         # Make them a developer.
@@ -239,7 +239,7 @@ class TestCommon(TestCase):
             ('Manage API Keys', reverse('devhub.api_key')),
             ('Reviewer Tools', reverse('reviewers.dashboard')),
         ]
-        check_links(expected, pq(response.content)('#aux-nav .tools a'), verify=False)
+        check_links(expected, pq(response.content)('#aux-nav .tools a'))
 
     def test_tools_admin(self):
         user = UserProfile.objects.get(email='admin@mozilla.com')
@@ -261,7 +261,7 @@ class TestCommon(TestCase):
             ('Reviewer Tools', reverse('reviewers.dashboard')),
             ('Admin Tools', reverse('admin:index')),
         ]
-        check_links(expected, pq(response.content)('#aux-nav .tools a'), verify=False)
+        check_links(expected, pq(response.content)('#aux-nav .tools a'))
 
     def test_tools_developer_and_admin(self):
         # Make them a developer.
@@ -287,7 +287,7 @@ class TestCommon(TestCase):
             ('Reviewer Tools', reverse('reviewers.dashboard')),
             ('Admin Tools', reverse('admin:index')),
         ]
-        check_links(expected, pq(response.content)('#aux-nav .tools a'), verify=False)
+        check_links(expected, pq(response.content)('#aux-nav .tools a'))
 
 
 class TestOtherStuff(TestCase):
@@ -382,6 +382,7 @@ class TestHeartbeat(TestCase):
             'rabbitmq',
             'signer',
             'remotesettings',
+            'cinder',
         ]:
             patcher = mock.patch(f'olympia.amo.monitors.{check}')
             self.mocks[check] = patcher.start()
@@ -496,8 +497,8 @@ class TestRobots(TestCase):
     @override_settings(ENGAGE_ROBOTS=True)
     def test_allow_mozilla_collections(self):
         """Make sure Mozilla collections are allowed"""
-        id_url = f"{reverse('collections.list')}{settings.TASK_USER_ID}/"
-        username_url = f"{reverse('collections.list')}mozilla/"
+        id_url = f'{reverse("collections.list")}{settings.TASK_USER_ID}/'
+        username_url = f'{reverse("collections.list")}mozilla/'
         response = self.client.get('/robots.txt')
         assert response.status_code == 200
         content = response.content.decode('utf-8')
@@ -509,7 +510,7 @@ class TestRobots(TestCase):
 
 @pytest.mark.django_db
 def test_fake_fxa_authorization_correct_values_passed():
-    with override_settings(DEBUG=True):  # USE_FAKE_FXA_AUTH is already True
+    with override_settings(DEV_MODE=True):  # USE_FAKE_FXA_AUTH is already True
         url = reverse('fake-fxa-authorization')
         response = test.Client().get(url, {'state': 'foobar'})
         assert response.status_code == 200
@@ -527,15 +528,15 @@ def test_fake_fxa_authorization_correct_values_passed():
 @pytest.mark.django_db
 def test_fake_fxa_authorization_deactivated():
     url = reverse('fake-fxa-authorization')
-    with override_settings(DEBUG=False, USE_FAKE_FXA_AUTH=False):
+    with override_settings(DEV_MODE=False, USE_FAKE_FXA_AUTH=False):
         response = test.Client().get(url)
     assert response.status_code == 404
 
-    with override_settings(DEBUG=False, USE_FAKE_FXA_AUTH=True):
+    with override_settings(DEV_MODE=False, USE_FAKE_FXA_AUTH=True):
         response = test.Client().get(url)
     assert response.status_code == 404
 
-    with override_settings(DEBUG=True, USE_FAKE_FXA_AUTH=False):
+    with override_settings(DEV_MODE=True, USE_FAKE_FXA_AUTH=False):
         response = test.Client().get(url)
     assert response.status_code == 404
 

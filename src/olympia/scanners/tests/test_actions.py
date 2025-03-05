@@ -59,7 +59,7 @@ class TestActions(TestCase):
         assert version.needshumanreview_set.filter(is_active=True).exists()
         assert (
             version.needshumanreview_set.get().reason
-            == version.needshumanreview_set.model.REASON_SCANNER_ACTION
+            == version.needshumanreview_set.model.REASONS.SCANNER_ACTION
         )
 
     def test_delay_auto_approval(self):
@@ -83,7 +83,7 @@ class TestActions(TestCase):
         )
         assert (
             version.needshumanreview_set.get().reason
-            == version.needshumanreview_set.model.REASON_SCANNER_ACTION
+            == version.needshumanreview_set.model.REASONS.SCANNER_ACTION
         )
 
     def test_delay_auto_approval_overwrite_null(self):
@@ -110,7 +110,7 @@ class TestActions(TestCase):
         assert version.needshumanreview_set.count() == 1
         assert (
             version.needshumanreview_set.get().reason
-            == version.needshumanreview_set.model.REASON_SCANNER_ACTION
+            == version.needshumanreview_set.model.REASONS.SCANNER_ACTION
         )
 
     def test_delay_auto_approval_overwrite_existing_lower_delay_on_right_channels(self):
@@ -148,7 +148,7 @@ class TestActions(TestCase):
         assert version.needshumanreview_set.count() == 1
         assert (
             version.needshumanreview_set.get().reason
-            == version.needshumanreview_set.model.REASON_SCANNER_ACTION
+            == version.needshumanreview_set.model.REASONS.SCANNER_ACTION
         )
 
     def test_delay_auto_approval_dont_overwrite_existing_higher_delay(self):
@@ -186,7 +186,7 @@ class TestActions(TestCase):
         assert version.needshumanreview_set.count() == 1
         assert (
             version.needshumanreview_set.get().reason
-            == version.needshumanreview_set.model.REASON_SCANNER_ACTION
+            == version.needshumanreview_set.model.REASONS.SCANNER_ACTION
         )
 
     def test_delay_auto_approval_overwrite_existing_lower_delay(self):
@@ -215,7 +215,7 @@ class TestActions(TestCase):
         assert version.needshumanreview_set.count() == 1
         assert (
             version.needshumanreview_set.get().reason
-            == version.needshumanreview_set.model.REASON_SCANNER_ACTION
+            == version.needshumanreview_set.model.REASONS.SCANNER_ACTION
         )
 
     def test_delay_auto_approval_existing_due_date_older(self):
@@ -240,7 +240,7 @@ class TestActions(TestCase):
         assert version.needshumanreview_set.count() == 1
         assert (
             version.needshumanreview_set.get().reason
-            == version.needshumanreview_set.model.REASON_SCANNER_ACTION
+            == version.needshumanreview_set.model.REASONS.SCANNER_ACTION
         )
 
     def test_delay_auto_approval_existing_due_date_newer(self):
@@ -272,7 +272,7 @@ class TestActions(TestCase):
         assert version.needshumanreview_set.count() == 1
         assert (
             version.needshumanreview_set.get().reason
-            == version.needshumanreview_set.model.REASON_SCANNER_ACTION
+            == version.needshumanreview_set.model.REASONS.SCANNER_ACTION
         )
 
     def test_delay_auto_approval_indefinitely(self):
@@ -287,7 +287,7 @@ class TestActions(TestCase):
         assert version.needshumanreview_set.count() == 1
         assert (
             version.needshumanreview_set.get().reason
-            == version.needshumanreview_set.model.REASON_SCANNER_ACTION
+            == version.needshumanreview_set.model.REASONS.SCANNER_ACTION
         )
 
     def test_delay_auto_approval_indefinitely_overwrite_existing(self):
@@ -307,7 +307,7 @@ class TestActions(TestCase):
         assert version.needshumanreview_set.count() == 1
         assert (
             version.needshumanreview_set.get().reason
-            == version.needshumanreview_set.model.REASON_SCANNER_ACTION
+            == version.needshumanreview_set.model.REASONS.SCANNER_ACTION
         )
 
     def test_delay_auto_approval_indefinitely_overwrite_existing_unlisted(self):
@@ -327,7 +327,7 @@ class TestActions(TestCase):
         assert version.needshumanreview_set.count() == 1
         assert (
             version.needshumanreview_set.get().reason
-            == version.needshumanreview_set.model.REASON_SCANNER_ACTION
+            == version.needshumanreview_set.model.REASONS.SCANNER_ACTION
         )
 
     def test_delay_auto_approval_indefinitely_and_restrict(self):
@@ -386,6 +386,45 @@ class TestActions(TestCase):
         assert not EmailUserRestriction.objects.filter(
             restriction_type=RESTRICTION_TYPES.ADDON_APPROVAL
         ).exists()
+        for restriction in IPNetworkUserRestriction.objects.all():
+            assert restriction.reason == (
+                'Automatically added because of a match by rule "None" on '
+                f'Addon {addon.pk} Version {addon.current_version.pk}.'
+            )
+
+    def test_delay_auto_approval_indefinitely_and_restrict_with_ipv6(self):
+        user1 = user_factory(last_login_ip='2001:0db8:4815:1623:4200:1337:cafe:d00d')
+        user2 = user_factory(last_login_ip='')
+        user3 = user_factory()
+        addon = addon_factory(users=[user1, user2])
+        FileUpload.objects.create(
+            addon=addon,
+            user=user3,
+            version=addon.current_version.version,
+            ip_address='1.2.3.4',
+            source=amo.UPLOAD_SOURCE_DEVHUB,
+            channel=amo.CHANNEL_LISTED,
+        )
+        version = addon.current_version
+        assert not version.needshumanreview_set.filter(is_active=True).exists()
+        assert addon.auto_approval_delayed_until is None
+        _delay_auto_approval_indefinitely_and_restrict(version=version, rule=None)
+
+        # For IPv6, the /64 was restricted.
+        assert IPNetworkUserRestriction.objects.filter(
+            network='2001:db8:4815:1623::/64',
+            restriction_type=RESTRICTION_TYPES.ADDON_SUBMISSION,
+        ).exists()
+        # For IPv4, the /32 (equivalent to that single IP) was restricted.
+        assert IPNetworkUserRestriction.objects.filter(
+            network='1.2.3.4/32', restriction_type=RESTRICTION_TYPES.ADDON_SUBMISSION
+        ).exists()
+        assert not IPNetworkUserRestriction.objects.filter(network=None).exists()
+        assert not IPNetworkUserRestriction.objects.filter(network='').exists()
+        assert not IPNetworkUserRestriction.objects.filter(
+            restriction_type=RESTRICTION_TYPES.ADDON_APPROVAL
+        ).exists()
+
         for restriction in IPNetworkUserRestriction.objects.all():
             assert restriction.reason == (
                 'Automatically added because of a match by rule "None" on '

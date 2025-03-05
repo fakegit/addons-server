@@ -35,7 +35,7 @@ from olympia.users.models import (
     UserProfile,
     UserRestrictionHistory,
 )
-from olympia.versions.models import Version
+from olympia.versions.models import Version, VersionProvenance
 
 from ..views import VersionView
 
@@ -128,6 +128,24 @@ class TestUploadVersion(BaseUploadVersionTestMixin, TestCase):
         response = self.client.put(self.url(self.guid, '12.5'))
         assert response.status_code == 401
 
+    def test_submissions_disabled(self):
+        self.create_flag('enable-submissions', note=':-(', everyone=False)
+        expected = {
+            'error': 'Add-on uploads are temporarily unavailable.',
+            'reason': ':-(',
+        }
+        response = self.request('POST')
+        assert response.status_code == 503
+        assert response.json() == expected
+        response = self.request('PUT')
+        assert response.status_code == 503
+        assert response.json() == expected
+        self.create_flag('enable-submissions', note=':-(', users=[self.user.id])
+        response = self.request('POST')
+        assert response.status_code != 503
+        response = self.request('PUT')
+        assert response.status_code != 503
+
     def test_addon_does_not_exist(self):
         guid = '@create-version'
         qs = Addon.unfiltered.filter(guid=guid)
@@ -151,6 +169,10 @@ class TestUploadVersion(BaseUploadVersionTestMixin, TestCase):
         )
         assert list(latest_version.compatible_apps.keys()) == [amo.FIREFOX]
         statsd_incr_mock.assert_any_call('signing.submission.webext_version.12_34')
+        provenance = VersionProvenance.objects.get()
+        assert provenance.version == latest_version
+        assert provenance.source == amo.UPLOAD_SOURCE_SIGNING_API
+        assert provenance.client_info == 'web-ext/12.34'
 
     def test_new_addon_random_slug_unlisted_channel(self):
         guid = '@create-webextension'
@@ -236,6 +258,10 @@ class TestUploadVersion(BaseUploadVersionTestMixin, TestCase):
         assert not version.file.is_mozilla_signed_extension
         assert list(version.compatible_apps.keys()) == [amo.FIREFOX]
         statsd_incr_mock.assert_any_call('signing.submission.webext_version.12_34')
+        provenance = VersionProvenance.objects.get()
+        assert provenance.version == version
+        assert provenance.source == amo.UPLOAD_SOURCE_SIGNING_API
+        assert provenance.client_info == 'web-ext/12.34'
 
     def test_version_already_uploaded(self):
         response = self.request('PUT', self.url(self.guid, '3.0'))
@@ -343,8 +369,7 @@ class TestUploadVersion(BaseUploadVersionTestMixin, TestCase):
             'PUT',
             guid=guid,
             version='0.0.1',
-            filename='src/olympia/files/fixtures/files/'
-            'webextension_signed_already.xpi',
+            filename='src/olympia/files/fixtures/files/webextension_signed_already.xpi',
         )
         assert response.status_code == 201
         assert qs.exists()
@@ -364,8 +389,7 @@ class TestUploadVersion(BaseUploadVersionTestMixin, TestCase):
             'PUT',
             guid=guid,
             version='0.0.1',
-            filename='src/olympia/files/fixtures/files/'
-            'webextension_signed_already.xpi',
+            filename='src/olympia/files/fixtures/files/webextension_signed_already.xpi',
         )
         assert response.status_code == 400
         assert response.data['error'] == (
@@ -1476,9 +1500,12 @@ class TestSignedFile(SigningAPITestMixin, TestCase):
         assert response.status_code == 401
 
     def test_api_relies_on_version_downloader(self):
+        url = (
+            self.url()
+        )  # Resolve the URL before mocking to not mess up URL resolving cache
         with mock.patch('olympia.versions.views.download_file') as df:
             df.return_value = Response({})
-            self.get(self.url())
+            self.get(url)
         assert df.called is True
         assert df.call_args[0][0].user == self.user
         assert df.call_args[0][1] == str(self.file_.pk)

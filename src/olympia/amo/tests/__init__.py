@@ -53,7 +53,7 @@ from olympia.amo.utils import SafeStorage, use_fake_fxa
 from olympia.api.tests import JWTAuthKeyTester
 from olympia.applications.models import AppVersion
 from olympia.bandwagon.models import Collection
-from olympia.blocklist.models import Block, BlockVersion
+from olympia.blocklist.models import Block, BlockType, BlockVersion
 from olympia.constants.categories import CATEGORIES
 from olympia.files.models import File
 from olympia.promoted.models import (
@@ -147,7 +147,7 @@ def initial(form):
     return data
 
 
-def check_links(expected, elements, selected=None, verify=True):
+def check_links(expected, elements, selected=None):
     """Useful for comparing an `expected` list of links against PyQuery
     `elements`. Expected format of links is a list of tuples, like so:
 
@@ -159,9 +159,6 @@ def check_links(expected, elements, selected=None, verify=True):
 
     If you'd like to check if a particular item in the list is selected,
     pass as `selected` the title of the link.
-
-    Links are verified by default.
-
     """
     for idx, item in enumerate(expected):
         # List item could be `(text, link)`.
@@ -171,19 +168,19 @@ def check_links(expected, elements, selected=None, verify=True):
         elif isinstance(item, str):
             text, link = None, item
 
-        e = elements.eq(idx)
+        elm = elements.eq(idx)
         if text is not None:
-            assert e.text() == text, f'At index {idx}, expected {text}, got {e.text()}'
+            assert elm.text() == text, (
+                f'At index {idx}, expected {text}, got {elm.text()}'
+            )
         if link is not None:
             # If we passed an <li>, try to find an <a>.
-            if not e.filter('a'):
-                e = e.find('a')
-            assert_url_equal(e.attr('href'), link)
-            if verify and link != '#':
-                assert Client().head(link, follow=True).status_code == 200
+            if not elm.filter('a'):
+                elm = elm.find('a')
+            assert_url_equal(elm.attr('href'), link)
         if text is not None and selected is not None:
-            e = e.filter('.selected, .sel') or e.parents('.selected, .sel')
-            assert bool(e.length) == (text == selected)
+            elm = elm.filter('.selected, .sel') or elm.parents('.selected, .sel')
+            assert bool(elm.length) == (text == selected)
 
 
 def assert_url_equal(url, expected, compare_host=False):
@@ -510,9 +507,9 @@ class TestCase(PatchMixin, InitializeSessionMixin, test.TestCase):
             now = datetime.now()
         now_ts = time.mktime(now.timetuple())
 
-        assert (
-            dt_earlier_ts < now_ts < dt_later_ts
-        ), f'Expected datetime to be within a minute of {now}. Got {dt!r}.'
+        assert dt_earlier_ts < now_ts < dt_later_ts, (
+            f'Expected datetime to be within a minute of {now}. Got {dt!r}.'
+        )
 
     def assertQuerySetContentsEqual(self, qs1, qs2):
         """
@@ -586,9 +583,9 @@ class TestCase(PatchMixin, InitializeSessionMixin, test.TestCase):
             version.update(channel=channel)
 
     @classmethod
-    def make_addon_promoted(cls, addon, group, approve_version=False):
+    def make_addon_promoted(cls, addon, group_id, approve_version=False):
         obj, created = PromotedAddon.objects.update_or_create(
-            addon=addon, defaults={'group_id': group.id}
+            addon=addon, defaults={'group_id': group_id}
         )
         if approve_version:
             obj.approve_for_version(addon.current_version)
@@ -625,9 +622,9 @@ class TestCase(PatchMixin, InitializeSessionMixin, test.TestCase):
         for throttle_class in view_class.throttle_classes:
             throttle = throttle_class()
             # generate a different value each time, emulating hitting different CDNs
-            fake_request.META[
-                'HTTP_X_FORWARDED_FOR'
-            ] = f'{remote_addr}, {get_random_ip()}'
+            fake_request.META['HTTP_X_FORWARDED_FOR'] = (
+                f'{remote_addr}, {get_random_ip()}'
+            )
             # allow_request() fetches the history, triggers a success/failure
             # and if it's a success it will add the request to the history and
             # set that in the cache. If it failed, we force a success anyway
@@ -671,6 +668,8 @@ def _get_created(created):
 def addon_factory(status=amo.STATUS_APPROVED, version_kw=None, file_kw=None, **kw):
     version_kw = version_kw or {}
     file_kw = file_kw or {}
+    if needshumanreview_kw := kw.pop('needshumanreview_kw', None):
+        version_kw['needshumanreview_kw'] = needshumanreview_kw
 
     # Disconnect signals until the last save.
     post_save.disconnect(
@@ -699,7 +698,7 @@ def addon_factory(status=amo.STATUS_APPROVED, version_kw=None, file_kw=None, **k
     if slug is None:
         slug = name.replace(' ', '-').lower()[:30]
 
-    promoted_group = kw.pop('promoted', None)
+    promoted_group_id = kw.pop('promoted_id', None)
     reviewer_flags = kw.pop('reviewer_flags', None)
 
     kwargs = {
@@ -727,8 +726,8 @@ def addon_factory(status=amo.STATUS_APPROVED, version_kw=None, file_kw=None, **k
         addon = Addon.objects.create(type=type_, **kwargs)
 
     # Save 2.
-    if promoted_group:
-        PromotedAddon.objects.create(addon=addon, group_id=promoted_group.id)
+    if promoted_group_id:
+        PromotedAddon.objects.create(addon=addon, group_id=promoted_group_id)
         if 'promotion_approved' not in version_kw:
             version_kw['promotion_approved'] = True
 
@@ -744,7 +743,7 @@ def addon_factory(status=amo.STATUS_APPROVED, version_kw=None, file_kw=None, **k
             case _:
                 file_kw['status'] = amo.STATUS_DISABLED
 
-    version = version_factory(file_kw, addon=addon, **version_kw)
+    version = version_factory(addon=addon, file_kw=file_kw, **version_kw)
     addon.update_version()
     if addon.current_version:
         # Override local version with fresh one fetched by update_version()
@@ -919,7 +918,6 @@ def version_review_flags_factory(**kw):
 def create_default_webext_appversion():
     versions = {
         amo.DEFAULT_WEBEXT_MIN_VERSION,
-        amo.DEFAULT_WEBEXT_MIN_VERSION_NO_ID,
         amo.DEFAULT_STATIC_THEME_MIN_VERSION_FIREFOX,
         amo.DEFAULT_WEBEXT_MAX_VERSION,
         amo.DEFAULT_WEBEXT_MIN_VERSION_MV3_FIREFOX,
@@ -940,7 +938,7 @@ def create_default_webext_appversion():
         AppVersion.objects.get_or_create(application=amo.ANDROID.id, version=version)
 
 
-def version_factory(file_kw=None, **kw):
+def version_factory(*, file_kw=None, needshumanreview_kw=None, **kw):
     # We can't create duplicates of AppVersions, so make sure the versions are
     # not already created in fixtures (use fake versions).
     min_app_version = kw.pop('min_app_version', '4.0.99')
@@ -984,8 +982,11 @@ def version_factory(file_kw=None, **kw):
     ver._compatible_apps = ver._create_compatible_apps(
         ver.apps.all().select_related('min', 'max')
     )
+    if needshumanreview_kw:
+        ver.needshumanreview_set.create(**needshumanreview_kw)
+
     if 'due_date' not in kw:
-        ver.inherit_due_date()
+        ver.reset_due_date()
     elif ver.due_date != kw['due_date']:
         # It got overridden after initial save, but we want it set to what we
         # intended, even if that's not consistent with should_have_due_date().
@@ -993,13 +994,13 @@ def version_factory(file_kw=None, **kw):
     return ver
 
 
-def block_factory(*, version_ids=None, **kwargs):
+def block_factory(*, version_ids=None, block_type=BlockType.BLOCKED, **kwargs):
     block = Block.objects.create(**kwargs)
     if version_ids is None and block.addon:
         version_ids = list(block.addon.versions.values_list('id', flat=True))
     if version_ids is not None:
         BlockVersion.objects.bulk_create(
-            BlockVersion(block=block, version_id=version_id)
+            BlockVersion(block=block, version_id=version_id, block_type=block_type)
             for version_id in version_ids
         )
     return block
@@ -1213,13 +1214,13 @@ def safe_exec(string, value=None, globals_=None, locals_=None):
     locals_ = locals_ or {}
     try:
         exec(force_str(string), globals_ or globals(), locals_)
-    except Exception as e:
+    except Exception as exc:
         if value:
             raise AssertionError(
-                f'Could not exec {string.strip()!r} (from value {value!r}): {e}'
-            )
+                f'Could not exec {string.strip()!r} (from value {value!r}): {exc}'
+            ) from exc
         else:
-            raise AssertionError(f'Could not exec {string.strip()!r}: {e}')
+            raise AssertionError(f'Could not exec {string.strip()!r}: {exc}') from exc
     return locals_
 
 

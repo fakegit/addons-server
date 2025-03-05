@@ -12,6 +12,7 @@ AMO uses JWT tokens in a different way. Notes:
 
 See https://github.com/GetBlimp/django-rest-framework-jwt/ for more info.
 """
+
 from calendar import timegm
 from datetime import datetime
 
@@ -54,9 +55,11 @@ def jwt_decode_handler(token, get_api_key=APIKey.get_jwt_key):
 
     try:
         api_key = get_api_key(key=token_data['iss'])
-    except ObjectDoesNotExist:
+    except ObjectDoesNotExist as exc:
         log.info('No API key for JWT issuer: {}'.format(token_data['iss']))
-        raise exceptions.AuthenticationFailed(detail='Unknown JWT iss (issuer).')
+        raise exceptions.AuthenticationFailed(
+            detail='Unknown JWT iss (issuer).'
+        ) from exc
 
     # TODO: add nonce checking to prevent replays. bug 1213354.
 
@@ -93,16 +96,17 @@ def jwt_decode_handler(token, get_api_key=APIKey.get_jwt_key):
             'Missing required claim during JWT authentication: '
             '{e.__class__.__name__}: {e}'.format(e=exc)
         )
-        raise exceptions.AuthenticationFailed(detail=f'Invalid JWT: {exc}.')
+        raise exceptions.AuthenticationFailed(detail=f'Invalid JWT: {exc}.') from exc
     except (jwt.exceptions.ImmatureSignatureError, jwt.InvalidIssuedAtError) as exc:
         log.info(
-            'Invalid iat during JWT authentication: '
-            '{e.__class__.__name__}: {e}'.format(e=exc)
+            'Invalid iat during JWT authentication: {e.__class__.__name__}: {e}'.format(
+                e=exc
+            )
         )
         raise exceptions.AuthenticationFailed(
             detail='JWT iat (issued at time) is invalid. Make sure your '
             'system clock is synchronized with something like TLSdate.'
-        )
+        ) from exc
     except Exception as exc:
         log.warning(
             'Unhandled exception during JWT authentication: '
@@ -112,8 +116,9 @@ def jwt_decode_handler(token, get_api_key=APIKey.get_jwt_key):
 
     if payload['exp'] - payload['iat'] > settings.MAX_APIKEY_JWT_AUTH_TOKEN_LIFETIME:
         log.info(
-            'JWT auth: expiration is too long; '
-            'iss={iss}, iat={iat}, exp={exp}'.format(**payload)
+            'JWT auth: expiration is too long; iss={iss}, iat={iat}, exp={exp}'.format(
+                **payload
+            )
         )
         raise exceptions.AuthenticationFailed(
             detail='JWT exp (expiration) is too long.'

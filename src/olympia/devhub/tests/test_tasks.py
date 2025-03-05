@@ -6,7 +6,6 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from unittest import mock
 
-from django.conf import settings
 from django.core import mail
 from django.core.files.storage import default_storage as storage
 from django.test.utils import override_settings
@@ -88,22 +87,11 @@ def test_recreate_previews(pngcrush_image_mock):
 
 class ValidatorTestCase(TestCase):
     def setUp(self):
-        self.create_appversion('firefox', '38.0a1')
-
         # Required for WebExtensions tests.
         self.create_appversion('firefox', '*')
-        self.create_appversion('firefox', '42.0')
-        self.create_appversion('firefox', '42.*')
-        self.create_appversion('firefox', '43.0')
-
-        # Required for 57-specific tests.
-        self.create_appversion('android', '38.0a1')
         self.create_appversion('android', '*')
-        self.create_appversion('firefox', '57.0')
-
-        # Required for Android tests.
-        self.create_appversion('android', '42.0')
-        self.create_appversion('android', '45.0')
+        self.create_appversion('firefox', amo.DEFAULT_WEBEXT_MIN_VERSION)
+        self.create_appversion('android', amo.DEFAULT_WEBEXT_MIN_VERSION)
 
     def create_appversion(self, name, version):
         return AppVersion.objects.create(application=amo.APPS[name].id, version=version)
@@ -559,7 +547,6 @@ class TestValidateFilePath(ValidatorTestCase):
         annotate_validation_results_mock.assert_called_with(
             results=run_addons_linter_mock.return_value,
             parsed_data=parse_addon_mock.return_value,
-            channel=amo.CHANNEL_UNLISTED,
         )
 
 
@@ -581,7 +568,6 @@ class TestInitialSubmissionAcknoledgementEmail(TestCase):
                 'detail_url': absolutify(addon.get_url_path()),
             },
             recipient_list=['del@icio.us'],
-            from_email=settings.ADDONS_EMAIL,
             use_deny_list=False,
             perm_setting='individual_contact',
         )
@@ -670,9 +656,12 @@ class TestSubmitFile(UploadMixin, TestCase):
     def test_file_passed_all_validations(self):
         file_ = get_addon_file('valid_webextension.xpi')
         upload = self.get_upload(abspath=file_, addon=self.addon, version='1.0')
-        tasks.submit_file(self.addon.pk, upload.pk)
+        tasks.submit_file(addon_pk=self.addon.pk, upload_pk=upload.pk, client_info=None)
         self.create_version_for_upload.assert_called_with(
-            self.addon, upload, amo.CHANNEL_LISTED
+            addon=self.addon,
+            upload=upload,
+            channel=amo.CHANNEL_LISTED,
+            client_info=None,
         )
 
     @mock.patch('olympia.devhub.tasks.FileUpload.passed_all_validations', True)
@@ -681,16 +670,19 @@ class TestSubmitFile(UploadMixin, TestCase):
         upload = self.get_upload(
             abspath=file_, addon=self.addon, version='1.0', channel=amo.CHANNEL_UNLISTED
         )
-        tasks.submit_file(self.addon.pk, upload.pk)
+        tasks.submit_file(addon_pk=self.addon.pk, upload_pk=upload.pk, client_info=None)
         self.create_version_for_upload.assert_called_with(
-            self.addon, upload, amo.CHANNEL_UNLISTED
+            addon=self.addon,
+            upload=upload,
+            channel=amo.CHANNEL_UNLISTED,
+            client_info=None,
         )
 
     @mock.patch('olympia.devhub.tasks.FileUpload.passed_all_validations', False)
     def test_file_not_passed_all_validations(self):
         file_ = get_addon_file('valid_webextension.xpi')
         upload = self.get_upload(abspath=file_, addon=self.addon, version='1.0')
-        tasks.submit_file(self.addon.pk, upload.pk)
+        tasks.submit_file(addon_pk=self.addon.pk, upload_pk=upload.pk, client_info=None)
         assert not self.create_version_for_upload.called
 
 

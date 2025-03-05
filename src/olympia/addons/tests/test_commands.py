@@ -1,6 +1,6 @@
 import random
 from contextlib import contextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta
 from unittest import mock
 
 from django.conf import settings
@@ -15,20 +15,19 @@ from olympia.abuse.models import AbuseReport
 from olympia.addons.management.commands import (
     fix_langpacks_with_max_version_star,
     process_addons,
-    update_and_clean_categories,
 )
-from olympia.addons.models import Addon, AddonCategory, DeniedGuid
+from olympia.addons.models import Addon, DeniedGuid
 from olympia.amo.tests import (
     TestCase,
     addon_factory,
+    create_default_webext_appversion,
     user_factory,
     version_factory,
 )
 from olympia.applications.models import AppVersion
-from olympia.constants.categories import CATEGORIES
 from olympia.files.models import FileValidation
 from olympia.ratings.models import Rating, RatingAggregate
-from olympia.reviewers.models import AutoApprovalSummary
+from olympia.reviewers.models import AutoApprovalSummary, NeedsHumanReview
 from olympia.versions.models import ApplicationsVersions, Version, VersionPreview
 
 
@@ -69,13 +68,13 @@ def test_process_addons_limit_addons():
     addon_ids = [addon_factory(status=amo.STATUS_APPROVED).id for _ in range(5)]
     assert Addon.objects.count() == 5
 
-    with count_subtask_calls(process_addons.sign_addons) as calls:
-        call_command('process_addons', task='resign_addons_for_cose')
+    with count_subtask_calls(process_addons.bump_and_resign_addons) as calls:
+        call_command('process_addons', task='bump_and_resign_addons')
         assert len(calls) == 1
         assert calls[0]['kwargs']['args'] == [addon_ids]
 
-    with count_subtask_calls(process_addons.sign_addons) as calls:
-        call_command('process_addons', task='resign_addons_for_cose', limit=2)
+    with count_subtask_calls(process_addons.bump_and_resign_addons) as calls:
+        call_command('process_addons', task='bump_and_resign_addons', limit=2)
         assert len(calls) == 1
         assert calls[0]['kwargs']['args'] == [addon_ids[:2]]
 
@@ -360,10 +359,14 @@ class TestExtractColorsFromStaticThemes(TestCase):
         assert preview.colors == [{'h': 4, 's': 8, 'l': 15, 'ratio': 0.16}]
 
 
-class TestResignAddonsForCose(TestCase):
-    @mock.patch('olympia.lib.crypto.tasks.sign_file')
-    def test_basic(self, sign_file_mock):
-        file_kw = {'filename': 'webextension.xpi'}
+class TestBumpAndResignAddons(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        create_default_webext_appversion()
+
+    @mock.patch('olympia.lib.crypto.tasks.bump_addon_version')
+    def test_basic(self, bump_addon_version_mock):
+        file_kw = {'filename': 'webextension.xpi', 'is_signed': True}
         user_factory(id=settings.TASK_USER_ID)
 
         with freeze_time('2019-04-01'):
@@ -374,25 +377,31 @@ class TestResignAddonsForCose(TestCase):
             version_factory(addon=addon_with_history, file_kw=file_kw)
             version_factory(addon=addon_with_history, file_kw=file_kw)
 
-            addon_factory(file_kw=file_kw)
-            addon_factory(type=amo.ADDON_STATICTHEME, file_kw=file_kw)
+            another_extension = addon_factory(file_kw=file_kw)
+            a_theme = addon_factory(type=amo.ADDON_STATICTHEME, file_kw=file_kw)
+            a_dict = addon_factory(type=amo.ADDON_DICT, file_kw=file_kw)
+
+            # Langpacks and non-public add-ons won't be bumped.
             addon_factory(type=amo.ADDON_LPAPP, file_kw=file_kw)
-            addon_factory(type=amo.ADDON_DICT, file_kw=file_kw)
+            addon_factory(status=amo.STATUS_DISABLED, file_kw=file_kw)
+            addon_factory(status=amo.STATUS_AWAITING_REVIEW, file_kw=file_kw)
+            addon_factory(status=amo.STATUS_NULL, file_kw=file_kw)
+            addon_factory(disabled_by_user=True, file_kw=file_kw)
 
         # Don't resign add-ons created after April 4th 2019
         with freeze_time('2019-05-01'):
             addon_factory(file_kw=file_kw)
             addon_factory(type=amo.ADDON_STATICTHEME, file_kw=file_kw)
 
-        # Search add-ons won't get re-signed, same with deleted and disabled
-        # versions. Also, only public addons are being resigned
-        addon_factory(status=amo.STATUS_DISABLED, file_kw=file_kw)
-        addon_factory(status=amo.STATUS_AWAITING_REVIEW, file_kw=file_kw)
-        addon_factory(status=amo.STATUS_NULL, file_kw=file_kw)
+        call_command('process_addons', task='bump_and_resign_addons')
 
-        call_command('process_addons', task='resign_addons_for_cose')
-
-        assert sign_file_mock.call_count == 5
+        assert bump_addon_version_mock.call_count == 4
+        assert {call[0][0] for call in bump_addon_version_mock.call_args_list} == {
+            addon_with_history.current_version,
+            another_extension.current_version,
+            a_theme.current_version,
+            a_dict.current_version,
+        }
 
 
 class TestDeleteObsoleteAddons(TestCase):
@@ -566,103 +575,108 @@ def test_delete_list_theme_previews():
     assert not VersionPreview.objects.filter(id=other_old_list_preview.id).exists()
 
 
-class TestUpdateAndCleanCategoriesCommand(TestCase):
-    def test_add_new_categories_for_old_android_categories(self):
-        regular_addon = addon_factory(
-            category=CATEGORIES[amo.ADDON_EXTENSION]['bookmarks']
+@pytest.mark.django_db
+def test_delete_erroneously_added_overgrowth_needshumanreview():
+    user_factory(pk=settings.TASK_USER_ID, display_name='Mozilla')
+    should_no_longer_have_nhr_or_due_date = [
+        # Basic case
+        addon_factory()
+        .current_version.needshumanreview_set.create(
+            reason=NeedsHumanReview.REASONS.HOTNESS_THRESHOLD,
+            created=datetime(2024, 11, 7),
         )
-        addon_with_obsolete_category_and_other = addon_factory(
-            category=CATEGORIES[amo.ADDON_EXTENSION]['other']
+        .version.addon,
+        # Somehow has 2 bogus NHR, one active one not
+        NeedsHumanReview.objects.create(
+            reason=NeedsHumanReview.REASONS.HOTNESS_THRESHOLD,
+            created=datetime(2024, 11, 7),
+            is_active=False,
+            version=addon_factory()
+            .current_version.needshumanreview_set.create(
+                reason=NeedsHumanReview.REASONS.HOTNESS_THRESHOLD,
+                created=datetime(2024, 11, 7),
+            )
+            .version,
+        ).version.addon,
+        # Has 2 versions both with the bogus NHR
+        NeedsHumanReview.objects.create(
+            version=version_factory(
+                addon=addon_factory()
+                .current_version.needshumanreview_set.create(
+                    reason=NeedsHumanReview.REASONS.HOTNESS_THRESHOLD,
+                    created=datetime(2024, 11, 7),
+                )
+                .version.addon,
+                channel=amo.CHANNEL_UNLISTED,
+            ),
+            reason=NeedsHumanReview.REASONS.HOTNESS_THRESHOLD,
+            created=datetime(2024, 11, 7),
+        ).version.addon,
+    ]
+    should_still_have_nhr_and_due_date = [
+        # Outside the range
+        addon_factory()
+        .current_version.needshumanreview_set.create(
+            reason=NeedsHumanReview.REASONS.HOTNESS_THRESHOLD,
+            created=datetime(2024, 11, 3),
         )
-        addon_with_obsolete_category_and_regular_one = addon_factory(
-            category=CATEGORIES[amo.ADDON_EXTENSION]['shopping']
+        .version.addon,
+        # In the range but wrong reason
+        addon_factory()
+        .current_version.needshumanreview_set.create(
+            reason=NeedsHumanReview.REASONS.UNKNOWN,
+            created=datetime(2024, 11, 6),
         )
-        AddonCategory.objects.create(
-            # Obsolete category that would map to `other` which the add-on
-            # already has.
-            addon=addon_with_obsolete_category_and_other,
-            category_id=153,
-        )
-        AddonCategory.objects.create(
-            # Obsolete extra category that maps to `feeds-news-blogging`.
-            addon=addon_with_obsolete_category_and_regular_one,
-            category_id=147,
-        )
-        assert AddonCategory.objects.count() == 5
-
-        command = update_and_clean_categories.Command()
-        command.add_new_categories_for_old_android_categories()
-
-        assert AddonCategory.objects.count() == 6
-        # Existing categories unchanged (even the obsolete ones)
-        assert AddonCategory.objects.filter(
-            addon=regular_addon,
-            category_id=CATEGORIES[amo.ADDON_EXTENSION]['bookmarks'].id,
+        .version.addon,
+    ]
+    should_no_longer_have_hotness_nhr_but_still_other_nhr_and_due_date = [
+        # Has both a bogus NHR (inside the range, reason we care about) and
+        # another valid one.
+        NeedsHumanReview.objects.create(
+            reason=NeedsHumanReview.REASONS.HOTNESS_THRESHOLD,
+            created=datetime(2024, 1, 1),
+            version=addon_factory()
+            .current_version.needshumanreview_set.create(
+                reason=NeedsHumanReview.REASONS.HOTNESS_THRESHOLD,
+                created=datetime(2024, 11, 7),
+            )
+            .version,
+        ).version.addon,
+        # Has 2 versions, one with bogus NHR but other version has a different,
+        # valid (because date outside the range) NHR for that same reason.
+        NeedsHumanReview.objects.create(
+            version=version_factory(
+                addon=addon_factory()
+                .current_version.needshumanreview_set.create(
+                    reason=NeedsHumanReview.REASONS.HOTNESS_THRESHOLD,
+                    created=datetime(2024, 11, 7),
+                )
+                .version.addon,
+                channel=amo.CHANNEL_UNLISTED,
+            ),
+            reason=NeedsHumanReview.REASONS.HOTNESS_THRESHOLD,
+        ).version.addon,
+    ]
+    call_command(
+        'process_addons', task='delete_erroneously_added_overgrowth_needshumanreview'
+    )
+    for addon in should_no_longer_have_nhr_or_due_date:
+        assert not addon.versions.filter(due_date__isnull=False).exists()
+        assert not NeedsHumanReview.objects.filter(
+            version__addon=addon, is_active=True
         ).exists()
-        assert AddonCategory.objects.filter(
-            addon=addon_with_obsolete_category_and_other,
-            category_id=CATEGORIES[amo.ADDON_EXTENSION]['other'].id,
+    for addon in should_still_have_nhr_and_due_date:
+        assert addon.versions.filter(due_date__isnull=False).exists()
+        assert NeedsHumanReview.objects.filter(
+            version__addon=addon, is_active=True
         ).exists()
-        assert AddonCategory.objects.filter(
-            addon=addon_with_obsolete_category_and_regular_one,
-            category_id=CATEGORIES[amo.ADDON_EXTENSION]['shopping'].id,
+    for addon in should_no_longer_have_hotness_nhr_but_still_other_nhr_and_due_date:
+        assert addon.versions.filter(due_date__isnull=False).exists()
+        assert NeedsHumanReview.objects.filter(
+            version__addon=addon, is_active=True
         ).exists()
-        assert AddonCategory.objects.filter(
-            addon=addon_with_obsolete_category_and_other, category_id=153
-        ).exists()
-        assert AddonCategory.objects.filter(
-            addon=addon_with_obsolete_category_and_regular_one, category_id=147
-        ).exists()
-        # New category added to replace 147. No category was added for 153
-        # since it maps to `other`, which would be a duplicate.
-        assert AddonCategory.objects.filter(
-            addon=addon_with_obsolete_category_and_regular_one,
-            category_id=CATEGORIES[amo.ADDON_EXTENSION]['feeds-news-blogging'].id,
-        ).exists()
-
-    def test_delete_old_categories(self):
-        regular_addon = addon_factory(
-            category=CATEGORIES[amo.ADDON_EXTENSION]['bookmarks']
-        )
-        addon_with_obsolete_category_and_other = addon_factory(
-            category=CATEGORIES[amo.ADDON_EXTENSION]['other']
-        )
-        addon_with_obsolete_category_and_regular_one = addon_factory(
-            category=CATEGORIES[amo.ADDON_EXTENSION]['shopping']
-        )
-        addon_with_bad_category = addon_factory()
-        AddonCategory.objects.create(
-            # Obsolete category that would map to `other` which the add-on
-            # already has.
-            addon=addon_with_obsolete_category_and_other,
-            category_id=153,
-        )
-        AddonCategory.objects.create(
-            # Obsolete extra category that maps to `feeds-news-blogging`.
-            addon=addon_with_obsolete_category_and_regular_one,
-            category_id=147,
-        )
-        AddonCategory.objects.filter(addon=addon_with_bad_category).update(
-            # Obsolete extra category that doesn't map to anything.
-            category_id=666,
-        )
-        assert AddonCategory.objects.count() == 6
-
-        command = update_and_clean_categories.Command()
-        command.BATCH_SIZE = 1
-        command.delete_old_categories()
-
-        assert AddonCategory.objects.count() == 3
-        # Non-obsolete categories were kept.
-        assert AddonCategory.objects.filter(
-            addon=regular_addon,
-            category_id=CATEGORIES[amo.ADDON_EXTENSION]['bookmarks'].id,
-        ).exists()
-        assert AddonCategory.objects.filter(
-            addon=addon_with_obsolete_category_and_other,
-            category_id=CATEGORIES[amo.ADDON_EXTENSION]['other'].id,
-        ).exists()
-        assert AddonCategory.objects.filter(
-            addon=addon_with_obsolete_category_and_regular_one,
-            category_id=CATEGORIES[amo.ADDON_EXTENSION]['shopping'].id,
+        assert NeedsHumanReview.objects.filter(
+            version__addon=addon,
+            is_active=True,
+            reason=NeedsHumanReview.REASONS.HOTNESS_THRESHOLD,
         ).exists()

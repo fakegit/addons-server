@@ -134,7 +134,7 @@ ADDON_TYPE = {
     _ADDON_LPADDON: _('Deprecated Language Pack (Add-on)'),
     _ADDON_PLUGIN: _('Deprecated Plugin'),
     _ADDON_PERSONA: _('Deprecated LWT'),
-    ADDON_STATICTHEME: _('Theme (Static)'),
+    ADDON_STATICTHEME: _('Theme'),
     _ADDON_SITE_PERMISSION: _('Deprecated Site Permission'),
 }
 
@@ -148,7 +148,7 @@ ADDON_TYPES = {
     _ADDON_LPADDON: _('Deprecated Language Packs (Add-on)'),
     _ADDON_PLUGIN: _('Deprecated Plugins'),
     _ADDON_PERSONA: _('Deprecated LWTs'),
-    ADDON_STATICTHEME: _('Themes (Static)'),
+    ADDON_STATICTHEME: _('Themes'),
     _ADDON_SITE_PERMISSION: _('Deprecated Site Permissions'),
 }
 
@@ -205,14 +205,14 @@ ADDON_TYPES_WITH_STATS = (
 
 # Edit addon information
 MAX_TAGS = 10
-MAX_CATEGORIES = 2
+MAX_CATEGORIES = 3
 CONTRIBUTE_UTM_PARAMS = {
     'utm_content': 'product-page-contribute',
     'utm_medium': 'referral',
     'utm_source': 'addons.mozilla.org',
 }
 VALID_CONTRIBUTION_DOMAINS = (
-    'www.buymeacoffee.com',
+    'buymeacoffee.com',
     'donate.mozilla.org',
     'flattr.com',
     'github.com',
@@ -329,20 +329,19 @@ ADDON_ID = r"""(?P<addon_id>[^/<>"']+)"""
 ADDON_UUID = r'(?P<uuid>[\w]{8}-[\w]{4}-[\w]{4}-[\w]{4}-[\w]{12})'
 
 # Default strict_min_version and strict_max_version for WebExtensions
-DEFAULT_WEBEXT_MIN_VERSION = '42.0'
+# We're signing with SHA256 nowadays, which is only supported in 58.0 or higher
+DEFAULT_WEBEXT_MIN_VERSION = '58.0'
 DEFAULT_WEBEXT_MAX_VERSION = '*'
 
-# Android only started to support WebExtensions with version 48
-DEFAULT_WEBEXT_MIN_VERSION_ANDROID = '48.0'
+# Android only started to support WebExtensions with version 48,
+# but because we're now signing with SHA256 (see above), the minimum
+# version has to be 58.0.
+DEFAULT_WEBEXT_MIN_VERSION_ANDROID = '58.0'
 
-# The default version of Firefox that supports WebExtensions without an id
-DEFAULT_WEBEXT_MIN_VERSION_NO_ID = '48.0'
-
-# The default version of Firefox that supported `browser_specific_settings`
-DEFAULT_WEBEXT_MIN_VERSION_BROWSER_SPECIFIC = '48.0'
-
-# The version of desktop Firefox that first supported static themes.
-DEFAULT_STATIC_THEME_MIN_VERSION_FIREFOX = '53.0'
+# The version of desktop Firefox that first supported static themes is 53.0,
+# but as above because we're now signing with SHA256, the minimum version has
+# to be 58.0.
+DEFAULT_STATIC_THEME_MIN_VERSION_FIREFOX = '58.0'
 
 # The version of Firefox that first supported webext dictionaries.
 # Dicts are not compatible with Firefox for Android, only desktop is relevant.
@@ -393,6 +392,8 @@ RESERVED_ADDON_GUIDS = (
     '@temporary-addon',
     # Android Components/Fenix built-in extensions.
     '@mozac.org',
+    # Test privileged add-ons for mozilla-central.
+    '@tests.mozilla.org',
 )
 
 MOZILLA_TRADEMARK_SYMBOLS = ('mozilla', 'firefox')

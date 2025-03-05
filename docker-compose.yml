@@ -1,6 +1,7 @@
-version: "2.4"
-
 x-env-mapping: &env
+  # https://docs.docker.com/compose/environment-variables/envvars-precedence/
+  env_file:
+    - .env
   environment:
     - CELERY_BROKER_URL=amqp://olympia:olympia@rabbitmq/olympia
     - CELERY_RESULT_BACKEND=redis://redis:6379/1
@@ -12,61 +13,87 @@ x-env-mapping: &env
     - OLYMPIA_SITE_URL=http://olympia.test
     - PYTHONDONTWRITEBYTECODE=1
     - PYTHONUNBUFFERED=1
+    - PYTHONBREAKPOINT=ipdb.set_trace
     - TERM=xterm-256color
-    - CIRCLECI=${CIRCLECI}
     - HISTFILE=/data/olympia/docker/artifacts/bash_history
     - HISTSIZE=50000
     - HISTIGNORE=ls:exit:"cd .."
     - HISTCONTROL=erasedups
-    # Note: docker compose uses the values exported from .env for GID/UID if
-    # they exist. ./docker/fix_olympia_user.sh uses those variables to fix
-    # the uid/gid of the user to match the host if necessary.
-    - UID=${UID:-9500}
-    - GID=${UID:-9500}
+    - ENV=local
+    - CIRCLECI
+    - DATA_BACKUP_SKIP
+
+x-olympia: &olympia
+  <<: *env
+  image: ${DOCKER_TAG:-}
+  # We don't want docker compose to manage the image for us.
+  # We sometimes build the image locally and sometimes pull from a registry
+  # but docker compose should always assume the image is available.
+  pull_policy: never
+  # We drop down to a different user through entrypoint.sh, but starting as
+  # root allows us to fix the ownership of files generated at image build
+  # time through the ./docker/entrypoint.sh script.
+  user: root
+  platform: linux/amd64
+  entrypoint: ["/data/olympia/docker/entrypoint.sh"]
 
 services:
-  worker: &worker
-    <<: *env
-    image: mozilla/addons-server:latest
-    # We drop down to a different user through supervisord, but starting as
-    # root allows us to fix the ownership of files generated at image build
-    # time through the ./docker/fix_olympia_user.sh script.
-    user: root
-    platform: linux/amd64
-    command:
-      - /bin/sh
-      - -c
-      - |
-        ./docker/fix_olympia_user.sh
-        supervisord -n -c /data/olympia/docker/supervisor-celery.conf
+  static:
+    <<: *olympia
+    ports:
+      - "5173:5173"
     volumes:
-      - .:/data/olympia
-      - ./deps:/deps
-      - ./package.json:/deps/package.json
-      - ./package-lock.json:/deps/package-lock.json
+      - ./:/data/olympia
+      - ./deps:/data/olympia/deps
+    command: make run_vite
+
+  worker:
+    <<: *olympia
+    command: [
+      "DJANGO_SETTINGS_MODULE=settings",
+      "watchmedo",
+      "auto-restart",
+      "--directory=/data/olympia/src",
+      "--pattern=*.py",
+      "--recursive",
+      "--no-restart-on-command-exit",
+      "--",
+      "celery -A olympia.amo.celery:app worker -E -c 2 --loglevel=INFO",
+    ]
+    volumes:
+      - ./:/data/olympia
     extra_hosts:
      - "olympia.test:127.0.0.1"
+    restart: on-failure:5
+    healthcheck:
+      test: ["CMD-SHELL", "./manage.py monitors --services celery_worker --skip-checks"]
+      interval: 30s
+      retries: 3
+      start_interval: 1s
+    depends_on:
+      - mysqld
+      - elasticsearch
+      - redis
+      - memcached
+      - rabbitmq
+      - autograph
 
   web:
-    <<: *worker
-    platform: linux/amd64
+    extends:
+      service: worker
     command:
-      - /bin/sh
-      - -c
-      - |
-        ./docker/fix_olympia_user.sh
-        supervisord -n -c /data/olympia/docker/supervisor.conf
+      - DJANGO_SETTINGS_MODULE=settings uwsgi --ini /data/olympia/docker/uwsgi.ini
+    healthcheck:
+      test: ["CMD-SHELL", "./manage.py monitors --services localdev_web --skip-checks"]
+      interval: 30s
+      retries: 3
+      start_interval: 1s
 
   nginx:
     image: nginx
     volumes:
-      - ./docker/nginx/addons.conf:/etc/nginx/conf.d/addons.conf
-      - ./static:/srv/static
-      - ./site-static:/srv/site-static
-      - ./storage/shared_storage/uploads:/srv/user-media
-      - ./storage/files:/srv/user-media/addons
-      - ./storage/guarded-addons:/srv/user-media/guarded-addons
-      - ./storage/sitemaps:/srv/user-media/sitemaps
+      - data_nginx:/etc/nginx/conf.d
+      - ./:/srv
     ports:
       - "80:80"
     networks:
@@ -75,12 +102,9 @@ services:
           - olympia.test
     depends_on:
       - web
-      - addons-frontend
 
   memcached:
-    image: memcached:1.4
-    # Remove this once we upgrade to a version that provides multi-platform images
-    platform: linux/amd64
+    image: memcached:1.5.16
 
   mysqld:
     image: mysql:8.0
@@ -89,9 +113,27 @@ services:
       - MYSQL_DATABASE=olympia
     ports:
     - "3306:3306"
+    volumes:
+      - data_mysqld:/var/lib/mysql
+    command:
+      # Optimize for development speed over durability
+      - --innodb-flush-log-at-trx-commit=0
+      - --innodb-buffer-pool-size=64M
+      - --innodb-log-buffer-size=8M
+      - --innodb-log-file-size=32M
+      # Skip DNS lookups
+      - --skip-name-resolve
+      # Disable performance schema for faster startup
+      - --performance-schema=OFF
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "--silent"]
+      start_interval: 1s
+      timeout: 2s
+      start_period: 10s
+      retries: 3
 
   elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.3
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.27
     environment:
       # Disable all xpack related features to avoid unrelated logging
       # in docker logs. https://github.com/mozilla/addons-server/issues/8887
@@ -107,9 +149,11 @@ services:
 
   redis:
     image: redis:6.2
+    volumes:
+      - data_redis:/data
 
   rabbitmq:
-    image: rabbitmq:3.8
+    image: rabbitmq:3.12
     hostname: olympia
     expose:
       - "5672"
@@ -117,13 +161,14 @@ services:
       - RABBITMQ_DEFAULT_USER=olympia
       - RABBITMQ_DEFAULT_PASS=olympia
       - RABBITMQ_DEFAULT_VHOST=olympia
+    volumes:
+      - data_rabbitmq:/var/lib/rabbitmq
 
   autograph:
-    image: mozilla/autograph:3.3.2
-    platform: linux/amd64
-    command: /go/bin/autograph -c /data/olympia/scripts/autograph_localdev_config.yaml
+    image: mozilla/autograph:7.3.3
+    command: /go/bin/autograph -c /data/autograph/autograph_localdev_config.yaml
     volumes:
-      - .:/data/olympia
+      - data_autograph:/data/autograph
 
   addons-frontend:
     <<: *env
@@ -141,3 +186,32 @@ services:
       # exposed using webpack and not by the node app server).
       - 7011:7011
     command: yarn amo:olympia
+
+networks:
+  default:
+    driver: bridge
+    enable_ipv6: false
+
+volumes:
+  # Volume for rabbitmq/redis to avoid anonymous volumes
+  data_rabbitmq:
+  data_redis:
+  data_mysqld:
+    # Keep this value in sync with Makefile-os
+    # External volumes must be manually created/destroyed
+    name: addons-server_data_mysqld
+    external: true
+  # Volume for nginx configuration
+  data_nginx:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${PWD}/docker/nginx
+  # Volume for autograph configuration
+  data_autograph:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${PWD}/docker/autograph

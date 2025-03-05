@@ -141,17 +141,6 @@ class TestLoginStartBaseView(WithDynamicEndpoints, TestCase):
         query = parse_qs(url.query)
         assert ':' not in query['state'][0]
 
-    def test_allows_code_manager_url(self):
-        self.initialize_session({})
-        code_manager_url = 'https://code.example.org'
-        to = f'{code_manager_url}/foobar'
-        with override_settings(CODE_MANAGER_URL=code_manager_url):
-            response = self.client.get(f'{self.url}?to={to}')
-        url = urlparse(response['location'])
-        query = parse_qs(url.query)
-        state_parts = query['state'][0].split(':')
-        assert base64.urlsafe_b64decode(state_parts[1] + '====') == to.encode()
-
     def test_allows_absolute_urls(self):
         self.initialize_session({})
         domain = 'example.org'
@@ -172,7 +161,7 @@ def has_cors_headers(response, origin='https://addons-frontend'):
 
 
 class TestLoginStartView(TestCase):
-    @override_settings(DEBUG=True, USE_FAKE_FXA_AUTH=True)
+    @override_settings(DEV_MODE=True, USE_FAKE_FXA_AUTH=True)
     def test_redirect_url_fake_fxa_auth(self):
         response = self.client.get(reverse_ns('accounts.login_start'))
         assert response.status_code == 302
@@ -700,7 +689,7 @@ class TestWithUser(TestCase):
         self.request.session['enforce_2fa'] = True
         self._test_should_continue_without_redirect_for_two_factor_auth()
 
-    @override_settings(DEBUG=True, USE_FAKE_FXA_AUTH=True)
+    @override_settings(DEV_MODE=True, USE_FAKE_FXA_AUTH=True)
     def test_fake_fxa_auth(self):
         self.user = user_factory()
         self.find_user.return_value = self.user
@@ -721,7 +710,7 @@ class TestWithUser(TestCase):
         assert kwargs['next_path'] == '/a/path/?'
         assert self.fxa_identify.call_count == 0
 
-    @override_settings(DEBUG=True, USE_FAKE_FXA_AUTH=True)
+    @override_settings(DEV_MODE=True, USE_FAKE_FXA_AUTH=True)
     def test_fake_fxa_auth_with_2fa(self):
         self.user = user_factory()
         self.find_user.return_value = self.user
@@ -1162,34 +1151,6 @@ class TestAuthenticateView(TestCase, InitializeSessionMixin):
             )
         self.assertRedirects(response, next_path, fetch_redirect_response=False)
 
-    def test_log_in_redirects_to_code_manager(self):
-        email = 'real@yeahoo.com'
-        UserProfile.objects.create(email=email)
-        self.fxa_identify.return_value = (
-            {'email': email, 'uid': '9001'},
-            self.token_data,
-        )
-        code_manager_url = 'https://example.org'
-        next_path = f'{code_manager_url}/path'
-        with override_settings(CODE_MANAGER_URL=code_manager_url):
-            response = self.client.get(
-                self.url,
-                {
-                    'code': 'code',
-                    'state': ':'.join(
-                        [
-                            self.fxa_state,
-                            force_str(base64.urlsafe_b64encode(next_path.encode())),
-                        ]
-                    ),
-                },
-            )
-        self.assertRedirects(response, next_path, fetch_redirect_response=False)
-        assert (
-            response['Cache-Control']
-            == 'max-age=0, no-cache, no-store, must-revalidate, private'
-        )
-
     def test_log_in_requires_https_when_request_is_secure(self):
         email = 'real@yeahoo.com'
         UserProfile.objects.create(email=email)
@@ -1488,19 +1449,19 @@ class TestAccountViewSetUpdate(TestCase):
             'display_name': ['Ensure this field has no more than 50 characters.']
         }
 
-        response = self.patch(data={'display_name': '\x7F\u20DF'})
+        response = self.patch(data={'display_name': '\x7f\u20df'})
         assert response.status_code == 400
         assert json.loads(force_str(response.content)) == {
             'display_name': ['Must contain at least one printable character.']
         }
 
-        response = self.patch(data={'display_name': '\u2800\u3164\u115F\u1160\uFFA0'})
+        response = self.patch(data={'display_name': '\u2800\u3164\u115f\u1160\uffa0'})
         assert response.status_code == 400
         assert json.loads(force_str(response.content)) == {
             'display_name': ['Must contain at least one printable character.']
         }
 
-        response = self.patch(data={'display_name': 'a\x7F'})
+        response = self.patch(data={'display_name': 'a\x7f'})
         assert response.status_code == 200
 
         response = self.patch(data={'display_name': 'a' * 50})
@@ -2406,9 +2367,7 @@ class TestFxaNotificationView(TestCase):
 
     def test_post(self):
         url = reverse_ns('fxa-notification', api_version='auth')
-        class_path = (
-            f'{FxaNotificationView.__module__}.' f'{FxaNotificationView.__name__}'
-        )
+        class_path = f'{FxaNotificationView.__module__}.{FxaNotificationView.__name__}'
         with (
             mock.patch(f'{class_path}.get_jwt_payload') as get_jwt_mock,
             mock.patch(f'{class_path}.process_event') as process_event_mock,

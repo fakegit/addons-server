@@ -1,21 +1,28 @@
+import json
+import uuid
 from datetime import datetime, timedelta
 from unittest.mock import call, patch
 
 from django.conf import settings
 from django.core import mail
+from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage as storage
 from django.test.utils import override_settings
 from django.urls import reverse
-from django.utils import translation
 
 import pytest
 import responses
 
 from olympia import amo
-from olympia.abuse.models import AbuseReport, CinderJob
-from olympia.activity.models import ActivityLog, ActivityLogToken, ReviewActionReasonLog
+from olympia.abuse.models import AbuseReport, CinderJob, CinderPolicy, ContentDecision
+from olympia.activity.models import (
+    ActivityLog,
+    ActivityLogToken,
+    AttachmentLog,
+    CinderPolicyLog,
+    ReviewActionReasonLog,
+)
 from olympia.addons.models import Addon, AddonApprovalsCounter, AddonReviewerFlags
-from olympia.amo.templatetags.jinja_helpers import absolutify
 from olympia.amo.tests import (
     TestCase,
     addon_factory,
@@ -26,13 +33,10 @@ from olympia.amo.tests import (
 )
 from olympia.amo.utils import send_mail
 from olympia.blocklist.models import Block, BlocklistSubmission
+from olympia.constants.abuse import DECISION_ACTIONS
 from olympia.constants.promoted import (
-    LINE,
-    NOTABLE,
-    RECOMMENDED,
-    SPONSORED,
-    SPOTLIGHT,
-    STRATEGIC,
+    PROMOTED_GROUP_CHOICES,
+    PROMOTED_GROUPS_BY_ID,
 )
 from olympia.files.models import File
 from olympia.lib.crypto.signing import SigningError
@@ -70,7 +74,6 @@ class TestReviewHelperBase(TestCase):
     __test__ = False
 
     fixtures = ['base/addon_3615', 'base/users']
-    preamble = 'Mozilla Add-ons: Delicious Bookmarks 2.1.072'
 
     def setUp(self):
         super().setUp()
@@ -82,6 +85,11 @@ class TestReviewHelperBase(TestCase):
         self.file = self.review_version.file
 
         self.create_paths()
+        responses.add_callback(
+            responses.POST,
+            f'{settings.CINDER_SERVER_URL}create_decision',
+            callback=lambda r: (201, {}, json.dumps({'uuid': uuid.uuid4().hex})),
+        )
 
     def remove_paths(self):
         if self.file.file and not storage.exists(self.file.file.path):
@@ -109,10 +117,10 @@ class TestReviewHelperBase(TestCase):
             if self.review_version:
                 self.review_version.reload()
             self.file.reload()
+        self.addon.update(status=status, type=type)
         self.helper = self.get_helper(
             content_review=content_review, human_review=human_review
         )
-        self.addon.update(status=status, type=type)
         ActivityLog.objects.for_addons(self.helper.addon).delete()
         data = self.get_data().copy()
         self.helper.set_data(data)
@@ -133,10 +141,6 @@ class TestReviewHelperBase(TestCase):
             human_review=human_review,
             content_review=content_review,
         )
-
-    def setup_type(self, status):
-        self.addon.update(status=status)
-        return self.get_helper().handler.review_type
 
     def check_log_count(self, id, user=None):
         user = user or self.user
@@ -160,17 +164,13 @@ class TestReviewHelper(TestReviewHelperBase):
         self.addCleanup(patcher.stop)
         self.sign_file_mock = patcher.start()
 
-    def test_type_nominated(self):
-        assert self.setup_type(amo.STATUS_NOMINATED) == 'extension_nominated'
-
-    def test_type_pending(self):
-        assert self.setup_type(amo.STATUS_NULL) == 'extension_pending'
-        assert self.setup_type(amo.STATUS_APPROVED) == 'extension_pending'
-        assert self.setup_type(amo.STATUS_DISABLED) == 'extension_pending'
-
-    def test_no_version(self):
-        helper = ReviewHelper(addon=self.addon, version=None, user=self.user)
-        assert helper.handler.review_type == 'extension_pending'
+    def check_subject(self, msg):
+        decision = ContentDecision.objects.first() or ContentDecision(
+            addon=self.addon, action=DECISION_ACTIONS.AMO_APPROVE
+        )
+        assert msg.subject == (
+            f'Mozilla Add-ons: Delicious Bookmarks [ref:{decision.get_reference_id()}]'
+        )
 
     def test_review_files(self):
         version_factory(
@@ -194,7 +194,9 @@ class TestReviewHelper(TestReviewHelperBase):
     def test_process_action_good(self):
         self.grant_permission(self.user, 'Addons:Review')
         self.helper = self.get_helper()
-        self.helper.set_data({'action': 'reply', 'comments': 'foo'})
+        self.helper.set_data(
+            {'action': 'reply', 'comments': 'foo', 'versions': [self.review_version]}
+        )
         self.helper.process()
         assert len(mail.outbox) == 1
 
@@ -223,6 +225,7 @@ class TestReviewHelper(TestReviewHelperBase):
             'reject_multiple_versions',
             'set_needs_human_review_multiple_versions',
             'reply',
+            'request_legal_review',
             'comment',
         ]
         assert (
@@ -243,6 +246,7 @@ class TestReviewHelper(TestReviewHelperBase):
             'reject_multiple_versions',
             'set_needs_human_review_multiple_versions',
             'reply',
+            'request_legal_review',
             'comment',
         ]
         assert (
@@ -261,6 +265,7 @@ class TestReviewHelper(TestReviewHelperBase):
             'reject_multiple_versions',
             'set_needs_human_review_multiple_versions',
             'reply',
+            'request_legal_review',
             'comment',
         ]
         f_statuses = [amo.STATUS_APPROVED, amo.STATUS_DISABLED]
@@ -280,6 +285,7 @@ class TestReviewHelper(TestReviewHelperBase):
             'reject_multiple_versions',
             'set_needs_human_review_multiple_versions',
             'reply',
+            'request_legal_review',
             'comment',
         ]
         assert (
@@ -300,6 +306,7 @@ class TestReviewHelper(TestReviewHelperBase):
             'reject_multiple_versions',
             'set_needs_human_review_multiple_versions',
             'reply',
+            'request_legal_review',
             'comment',
         ]
         assert (
@@ -314,7 +321,7 @@ class TestReviewHelper(TestReviewHelperBase):
         # Now make add a recommended promoted addon. The user should lose all
         # approve/reject actions (they are no longer considered an
         # "appropriate" reviewer for that add-on).
-        self.make_addon_promoted(self.addon, RECOMMENDED)
+        self.make_addon_promoted(self.addon, PROMOTED_GROUP_CHOICES.RECOMMENDED)
         expected = ['reply', 'comment']
         assert (
             list(
@@ -332,6 +339,7 @@ class TestReviewHelper(TestReviewHelperBase):
             'reject_multiple_versions',
             'set_needs_human_review_multiple_versions',
             'reply',
+            'request_legal_review',
             'comment',
         ]
         assert (
@@ -354,6 +362,7 @@ class TestReviewHelper(TestReviewHelperBase):
             'reject_multiple_versions',
             'set_needs_human_review_multiple_versions',
             'reply',
+            'request_legal_review',
             'comment',
         ]
         assert (
@@ -394,6 +403,7 @@ class TestReviewHelper(TestReviewHelperBase):
             'set_needs_human_review_multiple_versions',
             'reply',
             'request_admin_review',
+            'request_legal_review',
             'comment',
         ]
         assert (
@@ -422,7 +432,7 @@ class TestReviewHelper(TestReviewHelperBase):
     def test_actions_recommended(self):
         # Having Addons:Review is not enough to review
         # recommended extensions.
-        self.make_addon_promoted(self.addon, RECOMMENDED)
+        self.make_addon_promoted(self.addon, PROMOTED_GROUP_CHOICES.RECOMMENDED)
         self.grant_permission(self.user, 'Addons:Review')
         expected = ['reply', 'comment']
         assert (
@@ -434,7 +444,6 @@ class TestReviewHelper(TestReviewHelperBase):
             == expected
         )
 
-        expected = ['reply', 'comment']
         assert (
             list(
                 self.get_review_actions(
@@ -453,6 +462,7 @@ class TestReviewHelper(TestReviewHelperBase):
             'reject_multiple_versions',
             'set_needs_human_review_multiple_versions',
             'reply',
+            'request_legal_review',
             'comment',
         ]
         assert (
@@ -468,7 +478,7 @@ class TestReviewHelper(TestReviewHelperBase):
     def test_actions_recommended_content_review(self):
         # Having Addons:ContentReview is not enough to content review
         # recommended extensions.
-        self.make_addon_promoted(self.addon, RECOMMENDED)
+        self.make_addon_promoted(self.addon, PROMOTED_GROUP_CHOICES.RECOMMENDED)
         self.grant_permission(self.user, 'Addons:ContentReview')
         expected = ['reply', 'comment']
         assert (
@@ -490,6 +500,7 @@ class TestReviewHelper(TestReviewHelperBase):
             'reject_multiple_versions',
             'set_needs_human_review_multiple_versions',
             'reply',
+            'request_legal_review',
             'comment',
         ]
         assert (
@@ -507,7 +518,7 @@ class TestReviewHelper(TestReviewHelperBase):
         # Having Addons:Review or Addons:RecommendedReview
         # is not enough to review promoted addons that are in a group that is
         # admin_review=True.
-        self.make_addon_promoted(self.addon, LINE)
+        self.make_addon_promoted(self.addon, PROMOTED_GROUP_CHOICES.LINE)
         self.grant_permission(self.user, 'Addons:Review')
         expected = ['comment']
         assert (
@@ -529,13 +540,16 @@ class TestReviewHelper(TestReviewHelperBase):
         )
 
         # only for groups that are admin_review though
-        self.make_addon_promoted(self.addon, SPONSORED, approve_version=True)
+        self.make_addon_promoted(
+            self.addon, PROMOTED_GROUP_CHOICES.NOTABLE, approve_version=True
+        )
         expected = [
             'public',
             'reject',
             'reject_multiple_versions',
             'set_needs_human_review_multiple_versions',
             'reply',
+            'request_legal_review',
             'comment',
         ]
         assert (
@@ -549,7 +563,7 @@ class TestReviewHelper(TestReviewHelperBase):
         )
 
         # change it back to an admin_review group
-        self.make_addon_promoted(self.addon, SPOTLIGHT)
+        self.make_addon_promoted(self.addon, PROMOTED_GROUP_CHOICES.SPOTLIGHT)
 
         self.grant_permission(self.user, 'Addons:RecommendedReview')
         expected = ['comment']
@@ -569,11 +583,12 @@ class TestReviewHelper(TestReviewHelperBase):
             'public',
             'reject',
             'reject_multiple_versions',
-            'clear_pending_rejection_multiple_versions',
+            'change_or_clear_pending_rejection_multiple_versions',
             'clear_needs_human_review_multiple_versions',
             'set_needs_human_review_multiple_versions',
             'reply',
             'disable_addon',
+            'request_legal_review',
             'comment',
         ]
         assert (
@@ -611,6 +626,7 @@ class TestReviewHelper(TestReviewHelperBase):
             'confirm_multiple_versions',
             'set_needs_human_review_multiple_versions',
             'reply',
+            'request_legal_review',
             'comment',
         ]
         assert (
@@ -623,7 +639,7 @@ class TestReviewHelper(TestReviewHelperBase):
         )
 
         # unlisted shouldn't be affected by promoted group status either
-        self.make_addon_promoted(self.addon, LINE)
+        self.make_addon_promoted(self.addon, PROMOTED_GROUP_CHOICES.LINE)
         assert (
             list(
                 self.get_review_actions(
@@ -642,11 +658,12 @@ class TestReviewHelper(TestReviewHelperBase):
             'unreject_multiple_versions',
             'block_multiple_versions',
             'confirm_multiple_versions',
-            'clear_pending_rejection_multiple_versions',
+            'change_or_clear_pending_rejection_multiple_versions',
             'clear_needs_human_review_multiple_versions',
             'set_needs_human_review_multiple_versions',
             'reply',
             'disable_addon',
+            'request_legal_review',
             'comment',
         ]
         assert (
@@ -667,6 +684,7 @@ class TestReviewHelper(TestReviewHelperBase):
             'reject_multiple_versions',
             'set_needs_human_review_multiple_versions',
             'reply',
+            'request_legal_review',
             'comment',
         ]
         assert (
@@ -688,6 +706,7 @@ class TestReviewHelper(TestReviewHelperBase):
             'reject_multiple_versions',
             'set_needs_human_review_multiple_versions',
             'reply',
+            'request_legal_review',
             'comment',
         ]
         assert (
@@ -710,6 +729,7 @@ class TestReviewHelper(TestReviewHelperBase):
             'reject_multiple_versions',
             'set_needs_human_review_multiple_versions',
             'reply',
+            'request_legal_review',
             'comment',
         ]
         assert (
@@ -749,6 +769,7 @@ class TestReviewHelper(TestReviewHelperBase):
             'reject_multiple_versions',
             'set_needs_human_review_multiple_versions',
             'reply',
+            'request_legal_review',
             'comment',
         ]
         self.review_version = version_factory(addon=self.addon)
@@ -778,11 +799,12 @@ class TestReviewHelper(TestReviewHelperBase):
         expected = [
             'confirm_auto_approved',
             'reject_multiple_versions',
-            'clear_pending_rejection_multiple_versions',
+            'change_or_clear_pending_rejection_multiple_versions',
             'clear_needs_human_review_multiple_versions',
             'set_needs_human_review_multiple_versions',
             'reply',
             'disable_addon',
+            'request_legal_review',
             'comment',
         ]
         assert (
@@ -804,11 +826,12 @@ class TestReviewHelper(TestReviewHelperBase):
             'reject',
             'confirm_auto_approved',
             'reject_multiple_versions',
-            'clear_pending_rejection_multiple_versions',
+            'change_or_clear_pending_rejection_multiple_versions',
             'clear_needs_human_review_multiple_versions',
             'set_needs_human_review_multiple_versions',
             'reply',
             'disable_addon',
+            'request_legal_review',
             'comment',
         ]
         self.review_version = version_factory(addon=self.addon)
@@ -825,7 +848,7 @@ class TestReviewHelper(TestReviewHelperBase):
 
     def test_actions_disabled_addon(self):
         self.grant_permission(self.user, 'Addons:Review')
-        expected = ['reply', 'comment']
+        expected = ['reply', 'request_legal_review', 'comment']
         actions = list(
             self.get_review_actions(
                 addon_status=amo.STATUS_DISABLED,
@@ -840,10 +863,11 @@ class TestReviewHelper(TestReviewHelperBase):
 
         self.grant_permission(self.user, 'Reviews:Admin')
         expected = [
-            'clear_pending_rejection_multiple_versions',
+            'change_or_clear_pending_rejection_multiple_versions',
             'clear_needs_human_review_multiple_versions',
             'reply',
             'enable_addon',
+            'request_legal_review',
             'comment',
         ]
         actions = list(
@@ -855,7 +879,12 @@ class TestReviewHelper(TestReviewHelperBase):
 
     def test_actions_rejected_version(self):
         self.grant_permission(self.user, 'Addons:Review')
-        expected = ['set_needs_human_review_multiple_versions', 'reply', 'comment']
+        expected = [
+            'set_needs_human_review_multiple_versions',
+            'reply',
+            'request_legal_review',
+            'comment',
+        ]
 
         self.file.update(status=amo.STATUS_DISABLED)
         self.file.version.update(human_review_date=datetime.now())
@@ -866,11 +895,12 @@ class TestReviewHelper(TestReviewHelperBase):
         self.grant_permission(self.user, 'Reviews:Admin')
         expected = [
             'unreject_latest_version',
-            'clear_pending_rejection_multiple_versions',
+            'change_or_clear_pending_rejection_multiple_versions',
             'clear_needs_human_review_multiple_versions',
             'set_needs_human_review_multiple_versions',
             'reply',
             'disable_addon',
+            'request_legal_review',
             'comment',
         ]
         actions = list(self.get_helper().actions.keys())
@@ -894,7 +924,12 @@ class TestReviewHelper(TestReviewHelperBase):
 
     def test_actions_deleted_addon(self):
         self.grant_permission(self.user, 'Addons:Review')
-        expected = ['set_needs_human_review_multiple_versions', 'reply', 'comment']
+        expected = [
+            'set_needs_human_review_multiple_versions',
+            'reply',
+            'request_legal_review',
+            'comment',
+        ]
         actions = list(
             self.get_review_actions(
                 addon_status=amo.STATUS_DELETED,
@@ -906,7 +941,12 @@ class TestReviewHelper(TestReviewHelperBase):
     def test_actions_versions_needing_human_review(self):
         NeedsHumanReview.objects.create(version=self.review_version)
         self.grant_permission(self.user, 'Addons:Review')
-        expected = ['set_needs_human_review_multiple_versions', 'reply', 'comment']
+        expected = [
+            'set_needs_human_review_multiple_versions',
+            'reply',
+            'request_legal_review',
+            'comment',
+        ]
         actions = list(
             self.get_review_actions(
                 addon_status=amo.STATUS_DELETED,
@@ -917,16 +957,57 @@ class TestReviewHelper(TestReviewHelperBase):
 
         self.grant_permission(self.user, 'Reviews:Admin')
         expected = [
-            'clear_pending_rejection_multiple_versions',
+            'change_or_clear_pending_rejection_multiple_versions',
             'clear_needs_human_review_multiple_versions',
             'set_needs_human_review_multiple_versions',
             'reply',
+            'request_legal_review',
             'comment',
         ]
         actions = list(
             self.get_review_actions(
                 addon_status=amo.STATUS_DELETED,
                 file_status=amo.STATUS_DISABLED,
+            ).keys()
+        )
+        assert expected == actions
+
+    def test_actions_cinder_jobs_to_resolve(self):
+        self.grant_permission(self.user, 'Addons:Review')
+        job = CinderJob.objects.create(
+            target_addon=self.addon, resolvable_in_reviewer_tools=True
+        )
+        expected = [
+            'reject_multiple_versions',
+            'set_needs_human_review_multiple_versions',
+            'reply',
+            'resolve_reports_job',
+            'request_legal_review',
+            'comment',
+        ]
+        actions = list(
+            self.get_review_actions(
+                addon_status=amo.STATUS_APPROVED,
+                file_status=amo.STATUS_APPROVED,
+            ).keys()
+        )
+        assert expected == actions
+
+        ContentDecision.objects.create(
+            action=DECISION_ACTIONS.AMO_DISABLE_ADDON, addon=self.addon, appeal_job=job
+        )
+        expected = [
+            'reject_multiple_versions',
+            'set_needs_human_review_multiple_versions',
+            'reply',
+            'resolve_appeal_job',
+            'request_legal_review',
+            'comment',
+        ]
+        actions = list(
+            self.get_review_actions(
+                addon_status=amo.STATUS_APPROVED,
+                file_status=amo.STATUS_APPROVED,
             ).keys()
         )
         assert expected == actions
@@ -952,22 +1033,82 @@ class TestReviewHelper(TestReviewHelperBase):
         self.helper.handler.log_action(amo.LOG.APPROVE_VERSION)
         assert self.check_log_count(amo.LOG.APPROVE_VERSION.id) == 1
 
-    def test_log_action_sets_reasons(self):
+    def test_record_decision_sets_policies_and_reasons_with_allow_reasons(self):
+        self.grant_permission(self.user, 'Addons:Review')
+        self.file.update(status=amo.STATUS_AWAITING_REVIEW)
+        self.helper = self.get_helper()
         data = {
             'reasons': [
                 ReviewActionReason.objects.create(
-                    name='reason 1',
-                    is_active=True,
+                    name='reason 1', is_active=True, canned_response='.'
                 ),
                 ReviewActionReason.objects.create(
                     name='reason 2',
                     is_active=True,
+                    cinder_policy=CinderPolicy.objects.create(uuid='y'),
+                    canned_response='.',
                 ),
+            ],
+            # ignored - the action doesn't allow_policies
+            'cinder_policies': [
+                CinderPolicy.objects.create(uuid='x'),
+                CinderPolicy.objects.create(uuid='z'),
             ],
         }
         self.helper.set_data(data)
-        self.helper.handler.log_action(amo.LOG.APPROVE_VERSION)
+        self.helper.handler.review_action = self.helper.actions.get('public')
+        self.helper.handler.record_decision(amo.LOG.APPROVE_VERSION)
         assert ReviewActionReasonLog.objects.count() == 2
+        assert CinderPolicyLog.objects.count() == 1
+        assert (
+            ActivityLog.objects.get(action=amo.LOG.APPROVE_VERSION.id)
+            .contentdecisionlog_set.get()
+            .decision.action
+            == DECISION_ACTIONS.AMO_APPROVE_VERSION
+        )
+
+    @patch('olympia.reviewers.utils.report_decision_to_cinder_and_notify.delay')
+    def test_record_decision_sets_policies_with_allow_policies(self, report_mock):
+        self.grant_permission(self.user, 'Addons:Review')
+        cinder_job = CinderJob.objects.create(
+            target_addon=self.addon, resolvable_in_reviewer_tools=True
+        )
+        self.helper = self.get_helper()
+        data = {
+            # ignored - the action doesn't allow_reasons
+            'reasons': [
+                ReviewActionReason.objects.create(
+                    name='reason 1', is_active=True, canned_response='.'
+                ),
+                ReviewActionReason.objects.create(
+                    name='reason 2',
+                    is_active=True,
+                    cinder_policy=CinderPolicy.objects.create(uuid='y'),
+                    canned_response='.',
+                ),
+            ],
+            'cinder_policies': [
+                CinderPolicy.objects.create(uuid='x'),
+                CinderPolicy.objects.create(
+                    uuid='z', default_cinder_action=DECISION_ACTIONS.AMO_IGNORE
+                ),
+            ],
+            'cinder_jobs_to_resolve': [cinder_job],
+        }
+        self.helper.set_data(data)
+        self.helper.handler.review_action = self.helper.actions.get(
+            'resolve_reports_job'
+        )
+        self.helper.handler.record_decision(amo.LOG.RESOLVE_CINDER_JOB_WITH_NO_ACTION)
+        assert ReviewActionReasonLog.objects.count() == 0
+        assert CinderPolicyLog.objects.count() == 2
+        assert (
+            ActivityLog.objects.get(action=amo.LOG.RESOLVE_CINDER_JOB_WITH_NO_ACTION.id)
+            .contentdecisionlog_set.get()
+            .decision.action
+            == DECISION_ACTIONS.AMO_IGNORE
+        )
+        report_mock.assert_called_once()
 
     def test_log_action_override_user(self):
         # ActivityLog.user will default to self.user in log_action.
@@ -983,123 +1124,157 @@ class TestReviewHelper(TestReviewHelperBase):
         assert logs.count() == 1
         assert logs[0].user == task_user
 
-    def test_notify_email(self):
-        self.helper.set_data(self.get_data())
-        base_fragment = 'To respond, please reply to this email or visit'
-        user = self.addon.listed_authors[0]
-        ActivityLogToken.objects.create(version=self.review_version, user=user)
-        uuid = self.review_version.token.get(user=user).uuid.hex
-        reply_email = f'reviewreply+{uuid}@{settings.INBOUND_EMAIL_DOMAIN}'
+    def test_log_action_attachment_input(self):
+        assert AttachmentLog.objects.count() == 0
+        data = self.get_data()
+        text = 'This is input'
+        data['attachment_input'] = 'This is input'
+        self.helper.set_data(data)
+        self.helper.handler.log_action(amo.LOG.REJECT_VERSION)
+        assert AttachmentLog.objects.count() == 1
+        attachment_log = AttachmentLog.objects.first()
+        file_content = attachment_log.file.read().decode('utf-8')
+        assert file_content == text
 
-        templates = (
-            'extension_nominated_to_approved',
-            'extension_nominated_to_rejected',
-            'extension_pending_to_rejected',
-            'theme_nominated_to_approved',
-            'theme_nominated_to_rejected',
-            'theme_pending_to_rejected',
+    def test_log_action_attachment_file(self):
+        assert AttachmentLog.objects.count() == 0
+        text = "I'm a text file"
+        data = self.get_data()
+        data['attachment_file'] = ContentFile(text, name='attachment.txt')
+        self.helper.set_data(data)
+        self.helper.handler.log_action(amo.LOG.REJECT_VERSION)
+        assert AttachmentLog.objects.count() == 1
+        attachment_log = AttachmentLog.objects.first()
+        file_content = attachment_log.file.read().decode('utf-8')
+        assert file_content == text
+
+    def test_logging_is_similar_in_reviewer_tools_and_content_action(self):
+        data = {
+            **self.get_data(),
+            'action': 'disable_addon',
+            'reasons': [
+                ReviewActionReason.objects.create(
+                    name='reason 1', is_active=True, canned_response='.'
+                ),
+                ReviewActionReason.objects.create(
+                    name='reason 2',
+                    is_active=True,
+                    cinder_policy=CinderPolicy.objects.create(uuid='y'),
+                    canned_response='.',
+                ),
+            ],
+        }
+        self.grant_permission(self.user, 'Addons:Review')
+        self.grant_permission(self.user, 'Reviews:Admin')
+        self.helper = self.get_helper()
+        self.helper.set_data(data)
+        self.helper.handler.review_action = self.helper.actions[data['action']]
+
+        # first, record_decision but with the action completed so we log in ReviewHelper
+        self.helper.handler.record_decision(amo.LOG.FORCE_DISABLE)
+        logs = ActivityLog.objects.filter(action=amo.LOG.FORCE_DISABLE.id)
+        assert logs.count() == 1
+        reviewer_tools_activity = logs.get()
+        decision1 = ContentDecision.objects.last()
+        assert self.addon in reviewer_tools_activity.arguments
+        assert self.addon.current_version in reviewer_tools_activity.arguments
+        assert decision1 in reviewer_tools_activity.arguments
+        assert data['reasons'][0] in reviewer_tools_activity.arguments
+        assert data['reasons'][1] in reviewer_tools_activity.arguments
+        assert data['reasons'][1].cinder_policy in reviewer_tools_activity.arguments
+
+        # then repeat with action_completed=False, which will log in ContentAction
+        self.helper.handler.record_decision(
+            amo.LOG.FORCE_DISABLE, action_completed=False
         )
-        for template in templates:
-            mail.outbox = []
-            self.helper.handler.notify_email(template, 'Sample subject %s, %s')
-            assert len(mail.outbox) == 1
-            message = mail.outbox[0]
-            assert base_fragment in message.body
-            assert message.reply_to == [reply_email]
-
-        mail.outbox = []
-        # This one does not inherit from base.txt because it's for unlisted
-        # signing notification, which is not really something that necessitates
-        # reviewer interaction, so it's simpler.
-        template = 'unlisted_to_reviewed_auto'
-        self.helper.handler.notify_email(template, 'Sample subject %s, %s')
-        assert len(mail.outbox) == 1
-        message = mail.outbox[0]
-        assert base_fragment not in message.body
-        assert message.reply_to == [reply_email]
-
-    @patch('olympia.reviewers.utils.resolve_job_in_cinder.delay')
-    def test_resolve_abuse_reports(self, mock_resolve_task):
-        log_entry = ActivityLog.objects.create(
-            action=amo.LOG.APPROVE_VERSION.id, user=user_factory()
+        logs = ActivityLog.objects.filter(action=amo.LOG.FORCE_DISABLE.id).exclude(
+            id=reviewer_tools_activity.id
         )
-        self.helper.handler.log_entry = log_entry
+        assert logs.count() == 1
+        content_action_activity = logs.get()
+        decision2 = ContentDecision.objects.last()
+
+        # and compare
+        assert reviewer_tools_activity.details == content_action_activity.details
+        # reasons won't be in the arguments, because they're added afterwards
+        assert set(reviewer_tools_activity.arguments) - {
+            decision1,
+            *data['reasons'],
+        } == set(content_action_activity.arguments) - {decision2}
+        # but are present as ReviewActionReasonLog
+        query_string = 'reviewactionreasonlog__activity_log__contentdecision__id'
+        assert list(
+            ReviewActionReason.objects.filter(**{query_string: decision1.id})
+        ) == list(ReviewActionReason.objects.filter(**{query_string: decision2.id}))
+
+    @patch('olympia.reviewers.utils.report_decision_to_cinder_and_notify.delay')
+    def test_record_decision_calls_report_decision_to_cinder_and_notify(
+        self, mock_report
+    ):
         cinder_job1 = CinderJob.objects.create(job_id='1')
         cinder_job2 = CinderJob.objects.create(job_id='2')
+
+        # Without 'cinder_jobs_to_resolve', report_decision_to_cinder_and_notify the
+        # decision created is not linked to any job
+        self.helper.set_data(self.get_data())
+        self.helper.handler.record_decision(amo.LOG.APPROVE_VERSION)
+        decision = ContentDecision.objects.get()
+        mock_report.assert_called_once_with(decision_id=decision.id)
+        assert not hasattr(decision, 'cinder_job')
+
+        # With 'cinder_jobs_to_resolve', report_decision_to_cinder_and_notify the
+        # decision created is linked to a job
         self.helper.set_data(
-            {**self.get_data(), 'resolve_cinder_jobs': [cinder_job1, cinder_job2]}
+            {**self.get_data(), 'cinder_jobs_to_resolve': [cinder_job1, cinder_job2]}
         )
+        self.helper.handler.record_decision(amo.LOG.APPROVE_VERSION)
 
-        self.helper.handler.resolve_abuse_reports(
-            CinderJob.DECISION_ACTIONS.AMO_APPROVE
-        )
-
-        mock_resolve_task.assert_has_calls(
+        job_decision1, job_decision2 = ContentDecision.objects.all()[1:]
+        mock_report.assert_has_calls(
             [
-                call(
-                    cinder_job_id=cinder_job1.id,
-                    decision=CinderJob.DECISION_ACTIONS.AMO_APPROVE,
-                    log_entry_id=log_entry.id,
-                ),
-                call(
-                    cinder_job_id=cinder_job2.id,
-                    decision=CinderJob.DECISION_ACTIONS.AMO_APPROVE,
-                    log_entry_id=log_entry.id,
-                ),
+                call(decision_id=job_decision1.id),
+                call(decision_id=job_decision2.id),
             ]
         )
-
-    def test_email_links(self):
-        expected = {
-            'extension_nominated_to_approved': 'addon_url',
-            'extension_nominated_to_rejected': 'dev_versions_url',
-            'extension_pending_to_approved': 'addon_url',
-            'extension_pending_to_rejected': 'dev_versions_url',
-            'theme_nominated_to_approved': 'addon_url',
-            'theme_nominated_to_rejected': 'dev_versions_url',
-            'theme_pending_to_approved': 'addon_url',
-            'theme_pending_to_rejected': 'dev_versions_url',
-            'unlisted_to_reviewed_auto': 'dev_versions_url',
-            'reject_multiple_versions': 'dev_versions_url',
-            'reject_multiple_versions_with_delay': 'dev_versions_url',
-        }
-
-        self.helper.set_data(self.get_data())
-        context_data = self.helper.handler.get_context_data()
-        for template, context_key in expected.items():
-            mail.outbox = []
-            self.helper.handler.notify_email(template, 'Sample subject %s, %s')
-            assert len(mail.outbox) == 1
-            message = mail.outbox[0]
-            assert context_key in context_data
-            assert context_data.get(context_key) in message.body
+        assert job_decision1.cinder_job == cinder_job1
+        assert job_decision2.cinder_job == cinder_job2
 
     def test_send_reviewer_reply(self):
         self.setup_data(amo.STATUS_APPROVED)
+        self.helper.handler.data['versions'] = [self.addon.versions.get()]
         self.helper.handler.reviewer_reply()
 
         assert len(mail.outbox) == 1
         message = mail.outbox[0]
-        assert message.subject == self.preamble
+        assert message.subject == 'Mozilla Add-ons: Delicious Bookmarks 2.1.072'
 
         assert self.check_log_count(amo.LOG.REVIEWER_REPLY_VERSION.id) == 1
 
-    def test_email_no_locale(self):
-        self.addon.name = {'es': '¿Dónde está la biblioteca?'}
-        self.setup_data(amo.STATUS_NOMINATED)
-        with translation.override('es'):
-            assert translation.get_language() == 'es'
-            self.helper.handler.approve_latest_version()
+    def test_send_reviewer_reply_multiple_versions(self):
+        new_version = version_factory(addon=self.addon, version='3.0')
+        new_version2 = version_factory(addon=self.addon, version='3.2')
+        self.setup_data(amo.STATUS_APPROVED)
+        self.helper.handler.data['versions'] = [new_version, new_version2]
+        self.helper.handler.reviewer_reply()
 
-        assert len(mail.outbox) == 1
-        message = mail.outbox[0]
-        assert message.subject == (
-            'Mozilla Add-ons: Delicious Bookmarks 2.1.072 Approved'
+        # Should result in a single activity...
+        assert self.check_log_count(amo.LOG.REVIEWER_REPLY_VERSION.id) == 1
+        activity = (
+            ActivityLog.objects.for_addons(self.addon)
+            .filter(action=amo.LOG.REVIEWER_REPLY_VERSION.id)
+            .get()
         )
-        assert '/en-US/firefox/addon/a3615' not in message.body
-        assert '/es/firefox/addon/a3615' not in message.body
-        assert '/addon/a3615' in message.body
-        assert 'Your add-on, Delicious Bookmarks ' in message.body
+        assert [new_version, new_version2] == list(
+            vlog.version
+            for vlog in activity.versionlog_set.all().order_by('version__pk')
+        )
+
+        # ... but 2 emails, because we're sending them version per version.
+        assert len(mail.outbox) == 2
+        assert mail.outbox[0].subject == 'Mozilla Add-ons: Delicious Bookmarks 3.0'
+        assert 'foo' in mail.outbox[0].body
+        assert mail.outbox[1].subject == 'Mozilla Add-ons: Delicious Bookmarks 3.2'
+        assert 'foo' in mail.outbox[1].body
 
     def test_email_no_name(self):
         self.addon.name.delete()
@@ -1109,9 +1284,14 @@ class TestReviewHelper(TestReviewHelperBase):
 
         assert len(mail.outbox) == 1
         message = mail.outbox[0]
-        assert message.subject == ('Mozilla Add-ons: None 2.1.072 Approved')
+        decision = ContentDecision(
+            addon=self.addon, action=DECISION_ACTIONS.AMO_APPROVE
+        )
+        assert (
+            message.subject
+            == f'Mozilla Add-ons: None [ref:{decision.get_reference_id()}]'
+        )
         assert '/addon/a3615' in message.body
-        assert 'Your add-on, None ' in message.body
 
     def test_nomination_to_public_no_files(self):
         self.setup_data(amo.STATUS_NOMINATED)
@@ -1133,13 +1313,9 @@ class TestReviewHelper(TestReviewHelperBase):
         """Make sure new add-ons can be made public (bug 637959)"""
         status = amo.STATUS_NOMINATED
         self.setup_data(status)
-        AutoApprovalSummary.objects.create(
-            version=self.review_version, verdict=amo.AUTO_APPROVED, weight=101
-        )
 
         # Make sure we have no public files
-        for version in self.addon.versions.all():
-            version.file.update(status=amo.STATUS_AWAITING_REVIEW)
+        self.review_version.file.update(status=amo.STATUS_AWAITING_REVIEW)
 
         self.helper.handler.approve_latest_version()
 
@@ -1152,7 +1328,7 @@ class TestReviewHelper(TestReviewHelperBase):
 
         assert len(mail.outbox) == 1
         message = mail.outbox[0]
-        assert message.subject == '%s Approved' % self.preamble
+        self.check_subject(message)
 
         # AddonApprovalsCounter counter is now at 1 for this addon since there
         # was a human review.
@@ -1167,15 +1343,22 @@ class TestReviewHelper(TestReviewHelperBase):
     def test_nomination_to_public_need_human_review(self):
         self.setup_data(amo.STATUS_NOMINATED)
         NeedsHumanReview.objects.create(version=self.review_version)
+        NeedsHumanReview.objects.create(
+            version=self.review_version,
+            reason=NeedsHumanReview.REASONS.ABUSE_ADDON_VIOLATION,
+        )
         self.helper.handler.approve_latest_version()
         self.addon.reload()
         self.review_version.reload()
         self.file.reload()
         assert self.addon.status == amo.STATUS_APPROVED
         assert self.file.status == amo.STATUS_APPROVED
-        assert not self.review_version.needshumanreview_set.filter(
-            is_active=True
-        ).exists()
+        assert self.review_version.needshumanreview_set.filter(is_active=True).exists()
+        assert (
+            not self.review_version.needshumanreview_set.filter(is_active=True)
+            .exclude(reason__in=NeedsHumanReview.REASONS.ABUSE_OR_APPEAL_RELATED.values)
+            .exists()
+        )
         assert self.review_version.human_review_date
 
     def test_nomination_to_public_need_human_review_not_human(self):
@@ -1189,12 +1372,22 @@ class TestReviewHelper(TestReviewHelperBase):
         assert self.file.status == amo.STATUS_APPROVED
         assert self.review_version.needshumanreview_set.filter(is_active=True).exists()
         assert not self.review_version.human_review_date
+        activity = (
+            ActivityLog.objects.for_addons(self.addon)
+            .filter(action=amo.LOG.APPROVE_VERSION.id)
+            .get()
+        )
+        assert activity.details['human_review'] is False
 
     def test_unlisted_approve_latest_version_need_human_review(self):
         self.setup_data(
             amo.STATUS_NULL, channel=amo.CHANNEL_UNLISTED, human_review=True
         )
         NeedsHumanReview.objects.create(version=self.review_version)
+        NeedsHumanReview.objects.create(
+            version=self.review_version,
+            reason=NeedsHumanReview.REASONS.ABUSE_ADDON_VIOLATION,
+        )
         flags = version_review_flags_factory(
             version=self.review_version,
             needs_human_review_by_mad=True,
@@ -1210,12 +1403,21 @@ class TestReviewHelper(TestReviewHelperBase):
         addon_flags = self.addon.reviewerflags.reload()
         assert self.addon.status == amo.STATUS_NULL
         assert self.file.status == amo.STATUS_APPROVED
-        assert not self.review_version.needshumanreview_set.filter(
-            is_active=True
-        ).exists()
+        assert self.review_version.needshumanreview_set.filter(is_active=True).exists()
+        assert (
+            not self.review_version.needshumanreview_set.filter(is_active=True)
+            .exclude(reason__in=NeedsHumanReview.REASONS.ABUSE_OR_APPEAL_RELATED.values)
+            .exists()
+        )
         assert not flags.needs_human_review_by_mad
         assert not addon_flags.auto_approval_disabled_until_next_approval_unlisted
         assert self.review_version.human_review_date
+        activity = (
+            ActivityLog.objects.for_addons(self.addon)
+            .filter(action=amo.LOG.APPROVE_VERSION.id)
+            .get()
+        )
+        assert activity.details['human_review'] is True
 
     def test_unlisted_approve_latest_version_need_human_review_not_human(self):
         self.setup_data(
@@ -1242,6 +1444,12 @@ class TestReviewHelper(TestReviewHelperBase):
 
         # Not changed this this is not a human approval.
         assert addon_flags.auto_approval_disabled_until_next_approval_unlisted
+        activity = (
+            ActivityLog.objects.for_addons(self.addon)
+            .filter(action=amo.LOG.APPROVE_VERSION.id)
+            .get()
+        )
+        assert activity.details['human_review'] is False
 
     def _unlisted_approve_flag_if_passed_auto_approval_delayed_setup(self, delay):
         self.setup_data(
@@ -1307,7 +1515,7 @@ class TestReviewHelper(TestReviewHelperBase):
 
         assert len(mail.outbox) == 1
         message = mail.outbox[0]
-        assert message.subject == ('%s Approved' % self.preamble)
+        self.check_subject(message)
         assert 'has been approved' in message.body
 
         # AddonApprovalsCounter counter is now at 1 for this addon.
@@ -1318,20 +1526,20 @@ class TestReviewHelper(TestReviewHelperBase):
         assert storage.exists(self.file.file.path)
 
         assert self.check_log_count(amo.LOG.APPROVE_VERSION.id) == 1
+        activity = (
+            ActivityLog.objects.for_addons(self.addon)
+            .filter(action=amo.LOG.APPROVE_VERSION.id)
+            .get()
+        )
+        assert activity.details['human_review'] is True
 
-    def test_nomination_to_public_not_human(self):
+    def _test_nomination_to_public_not_human(self):
         self.sign_file_mock.reset()
-        self.setup_data(amo.STATUS_NOMINATED, human_review=False)
 
         self.helper.handler.approve_latest_version()
 
         assert self.addon.status == amo.STATUS_APPROVED
         assert self.addon.versions.all()[0].file.status == (amo.STATUS_APPROVED)
-
-        assert len(mail.outbox) == 1
-        message = mail.outbox[0]
-        assert message.subject == ('%s Approved' % self.preamble)
-        assert 'has been approved' in message.body
 
         # AddonApprovalsCounter counter is now at 0 for this addon since there
         # was an automatic approval.
@@ -1347,6 +1555,25 @@ class TestReviewHelper(TestReviewHelperBase):
         assert self.check_log_count(amo.LOG.APPROVE_VERSION.id, get_task_user()) == 1
 
         assert not self.review_version.human_review_date
+        activity = (
+            ActivityLog.objects.for_addons(self.addon)
+            .filter(action=amo.LOG.APPROVE_VERSION.id)
+            .get()
+        )
+        assert activity.details['human_review'] is False
+
+    def test_nomination_to_public_not_human(self):
+        self.setup_data(amo.STATUS_NOMINATED, human_review=False)
+        self._test_nomination_to_public_not_human()
+        assert len(mail.outbox) == 1
+        message = mail.outbox[0]
+        self.check_subject(message)
+        assert 'been automatically screened and tentatively approved' in message.body
+
+    def test_nomination_to_public_not_human_langpack(self):
+        self.setup_data(amo.STATUS_NOMINATED, human_review=False, type=amo.ADDON_LPAPP)
+        self._test_nomination_to_public_not_human()
+        assert len(mail.outbox) == 0
 
     def test_public_addon_with_version_awaiting_review_to_public(self):
         self.sign_file_mock.reset()
@@ -1360,7 +1587,6 @@ class TestReviewHelper(TestReviewHelperBase):
                 'filename': 'webextension.xpi',
             },
         )
-        self.preamble = 'Mozilla Add-ons: Delicious Bookmarks 3.0.42'
         self.file = self.review_version.file
         self.setup_data(amo.STATUS_APPROVED)
         AutoApprovalSummary.objects.create(
@@ -1386,8 +1612,8 @@ class TestReviewHelper(TestReviewHelperBase):
 
         assert len(mail.outbox) == 1
         message = mail.outbox[0]
-        assert message.subject == ('%s Updated' % self.preamble)
-        assert 'has been updated' in message.body
+        self.check_subject(message)
+        assert 'has been approved' in message.body
 
         # AddonApprovalsCounter counter is now at 2 for this addon since there
         # was another human review. The last human review date should have been
@@ -1403,6 +1629,12 @@ class TestReviewHelper(TestReviewHelperBase):
 
         self.addon.reviewerflags.reload()
         assert not self.addon.reviewerflags.auto_approval_disabled_until_next_approval
+        activity = (
+            ActivityLog.objects.for_addons(self.addon)
+            .filter(action=amo.LOG.APPROVE_VERSION.id)
+            .get()
+        )
+        assert activity.details['human_review'] is True
 
     def test_public_addon_with_version_need_human_review_to_public(self):
         self.old_version = self.addon.current_version
@@ -1426,6 +1658,12 @@ class TestReviewHelper(TestReviewHelperBase):
         self.old_version.reload()
         assert not self.old_version.needshumanreview_set.filter(is_active=True).exists()
         assert self.review_version.human_review_date
+        activity = (
+            ActivityLog.objects.for_addons(self.addon)
+            .filter(action=amo.LOG.APPROVE_VERSION.id)
+            .get()
+        )
+        assert activity.details['human_review'] is True
 
     def test_public_addon_with_auto_approval_temporarily_disabled_to_public(self):
         AddonReviewerFlags.objects.create(
@@ -1461,7 +1699,6 @@ class TestReviewHelper(TestReviewHelperBase):
                 'filename': 'webextension.xpi',
             },
         )
-        self.preamble = 'Mozilla Add-ons: Delicious Bookmarks 3.0.42'
         self.file = self.review_version.file
         self.setup_data(amo.STATUS_APPROVED)
         AutoApprovalSummary.objects.create(
@@ -1484,8 +1721,8 @@ class TestReviewHelper(TestReviewHelperBase):
 
         assert len(mail.outbox) == 1
         message = mail.outbox[0]
-        assert message.subject == ("%s didn't pass review" % self.preamble)
-        assert 'reviewed and did not meet the criteria' in message.body
+        self.check_subject(message)
+        assert 'that your content violates the following' in message.body
 
         # AddonApprovalsCounter counter is still at 1 for this addon.
         approval_counter = AddonApprovalsCounter.objects.get(addon=self.addon)
@@ -1563,8 +1800,10 @@ class TestReviewHelper(TestReviewHelperBase):
             .filter(action=amo.LOG.CONFIRM_AUTO_APPROVED.id)
             .get()
         )
-        assert activity.arguments == [self.addon, self.review_version]
+        decision = ContentDecision.objects.get()
+        assert activity.arguments == [self.addon, self.review_version, decision]
         assert activity.details['comments'] == ''
+        assert activity.details['human_review'] is True
         assert self.review_version.reload().human_review_date
 
     def test_public_with_unreviewed_version_addon_confirm_auto_approval(self):
@@ -1601,8 +1840,10 @@ class TestReviewHelper(TestReviewHelperBase):
             .filter(action=amo.LOG.CONFIRM_AUTO_APPROVED.id)
             .get()
         )
-        assert activity.arguments == [self.addon, self.current_version]
+        decision = ContentDecision.objects.get()
+        assert activity.arguments == [self.addon, self.current_version, decision]
         assert activity.details['comments'] == ''
+        assert activity.details['human_review'] is True
 
     def test_public_with_disabled_version_addon_confirm_auto_approval(self):
         self.grant_permission(self.user, 'Addons:Review')
@@ -1636,7 +1877,8 @@ class TestReviewHelper(TestReviewHelperBase):
             .filter(action=amo.LOG.CONFIRM_AUTO_APPROVED.id)
             .get()
         )
-        assert activity.arguments == [self.addon, self.current_version]
+        decision = ContentDecision.objects.get()
+        assert activity.arguments == [self.addon, self.current_version, decision]
         assert activity.details['comments'] == ''
 
     def test_addon_with_versions_pending_rejection_confirm_auto_approval(self):
@@ -1679,7 +1921,8 @@ class TestReviewHelper(TestReviewHelperBase):
             .filter(action=amo.LOG.CONFIRM_AUTO_APPROVED.id)
             .get()
         )
-        assert activity.arguments == [self.addon, self.review_version]
+        decision = ContentDecision.objects.get()
+        assert activity.arguments == [self.addon, self.review_version, decision]
         assert activity.details['comments'] == ''
 
         # None of the versions should be pending rejection anymore.
@@ -1698,7 +1941,9 @@ class TestReviewHelper(TestReviewHelperBase):
     def test_confirm_auto_approved_approves_for_promoted(self):
         self.grant_permission(self.user, 'Addons:Review')
         self.setup_data(amo.STATUS_APPROVED, file_status=amo.STATUS_APPROVED)
-        PromotedAddon.objects.create(addon=self.addon, group_id=NOTABLE.id)
+        PromotedAddon.objects.create(
+            addon=self.addon, group_id=PROMOTED_GROUP_CHOICES.NOTABLE
+        )
         self.create_paths()
 
         # Safeguards.
@@ -1710,10 +1955,12 @@ class TestReviewHelper(TestReviewHelperBase):
 
         self.addon.reload()
         self.addon.promotedaddon.reload()
-        assert self.addon.promoted_group() == NOTABLE, self.addon.promotedaddon
+        assert self.addon.promoted_group().id == PROMOTED_GROUP_CHOICES.NOTABLE, (
+            self.addon.promotedaddon
+        )
         assert self.review_version.reload().approved_for_groups == [
-            (NOTABLE, amo.FIREFOX),
-            (NOTABLE, amo.ANDROID),
+            (PROMOTED_GROUPS_BY_ID.get(PROMOTED_GROUP_CHOICES.NOTABLE), amo.FIREFOX),
+            (PROMOTED_GROUPS_BY_ID.get(PROMOTED_GROUP_CHOICES.NOTABLE), amo.ANDROID),
         ]
 
     def test_addon_with_version_need_human_review_confirm_auto_approval(self):
@@ -1910,7 +2157,13 @@ class TestReviewHelper(TestReviewHelperBase):
             .filter(action=amo.LOG.CONFIRM_AUTO_APPROVED.id)
             .get()
         )
-        assert activity.arguments == [self.addon, second_unlisted, first_unlisted]
+        decision = ContentDecision.objects.get()
+        assert activity.arguments == [
+            self.addon,
+            second_unlisted,
+            first_unlisted,
+            decision,
+        ]
 
     def test_unlisted_manual_approval_clear_pending_rejection(self):
         self.grant_permission(self.user, 'Addons:ReviewUnlisted')
@@ -1952,12 +2205,9 @@ class TestReviewHelper(TestReviewHelperBase):
 
         assert len(mail.outbox) == 1
         message = mail.outbox[0]
-        assert message.subject == ('%s signed and ready to download' % self.preamble)
-        assert (
-            '%s is now signed and ready for you to download'
-            % self.review_version.version
-            in message.body
-        )
+        self.check_subject(message)
+        assert f'Approved versions: {self.review_version.version}' in message.body
+        assert 'has been approved' in message.body
         assert 'You received this email because' not in message.body
 
         self.sign_file_mock.assert_called_with(self.file)
@@ -1992,8 +2242,8 @@ class TestReviewHelper(TestReviewHelperBase):
 
         assert len(mail.outbox) == 1
         message = mail.outbox[0]
-        assert message.subject == ("%s didn't pass review" % self.preamble)
-        assert 'did not meet the criteria' in message.body
+        self.check_subject(message)
+        assert 'your content violates' in message.body
 
         # AddonApprovalsCounter was not touched since we didn't approve.
         assert not AddonApprovalsCounter.objects.filter(addon=self.addon).exists()
@@ -2042,40 +2292,6 @@ class TestReviewHelper(TestReviewHelperBase):
         assert not self.addon.reviewerflags.reload().needs_admin_theme_review
         assert self.check_log_count(amo.LOG.CLEAR_ADMIN_REVIEW_THEME.id) == 1
 
-    def test_operating_system_present(self):
-        self.setup_data(amo.STATUS_APPROVED)
-        self.helper.handler.reject_latest_version()
-        message = mail.outbox[0]
-        assert 'Tested on osx with Firefox' in message.body
-
-    def test_operating_system_not_present(self):
-        self.setup_data(amo.STATUS_APPROVED)
-        data = self.get_data().copy()
-        data['operating_systems'] = ''
-        self.helper.set_data(data)
-        self.helper.handler.reject_latest_version()
-        message = mail.outbox[0]
-        assert 'Tested with Firefox' in message.body
-
-    def test_application_not_present(self):
-        self.setup_data(amo.STATUS_APPROVED)
-        data = self.get_data().copy()
-        data['applications'] = ''
-        self.helper.set_data(data)
-        self.helper.handler.reject_latest_version()
-        message = mail.outbox[0]
-        assert 'Tested on osx' in message.body
-
-    def test_both_not_present(self):
-        self.setup_data(amo.STATUS_APPROVED)
-        data = self.get_data().copy()
-        data['applications'] = ''
-        data['operating_systems'] = ''
-        self.helper.set_data(data)
-        self.helper.handler.reject_latest_version()
-        message = mail.outbox[0]
-        assert 'Tested' not in message.body
-
     def test_nominated_human_review_date_set_version_approve_latest_version(self):
         self.review_version.update(human_review_date=None)
         self.setup_data(amo.STATUS_NOMINATED)
@@ -2111,13 +2327,17 @@ class TestReviewHelper(TestReviewHelperBase):
         self.addon.update(status=amo.STATUS_NOMINATED)
         assert self.get_helper()
 
-    def _test_reject_multiple_versions(self, extra_data):
+    def _test_reject_multiple_versions(self, extra_data, human_review=True):
         old_version = self.review_version
         self.review_version = version_factory(addon=self.addon, version='3.0')
         AutoApprovalSummary.objects.create(
             version=self.review_version, verdict=amo.AUTO_APPROVED, weight=101
         )
-        self.setup_data(amo.STATUS_APPROVED, file_status=amo.STATUS_APPROVED)
+        self.setup_data(
+            amo.STATUS_APPROVED,
+            file_status=amo.STATUS_APPROVED,
+            human_review=human_review,
+        )
 
         # Safeguards.
         assert isinstance(self.helper.handler, ReviewFiles)
@@ -2128,7 +2348,10 @@ class TestReviewHelper(TestReviewHelperBase):
         self.helper.set_data(
             {**self.get_data(), 'versions': self.addon.versions.all(), **extra_data}
         )
-        self.helper.handler.reject_multiple_versions()
+        if human_review:
+            self.helper.handler.reject_multiple_versions()
+        else:
+            self.helper.handler.auto_reject_multiple_versions()
 
         self.addon.reload()
         self.file.reload()
@@ -2141,8 +2364,11 @@ class TestReviewHelper(TestReviewHelperBase):
         for version in self.addon.versions.all():
             assert version.pending_rejection is None
             assert version.pending_rejection_by is None
-            assert version.reviewerflags.pending_content_rejection is None
-            assert version.reload().human_review_date
+            assert version.pending_content_rejection is None
+            if human_review:
+                assert version.reload().human_review_date
+            else:
+                assert version.reload().human_review_date is None
 
         assert len(mail.outbox) == 1
         message = mail.outbox[0]
@@ -2150,47 +2376,70 @@ class TestReviewHelper(TestReviewHelperBase):
         log_token = ActivityLogToken.objects.get()
         assert log_token.uuid.hex in message.reply_to[0]
 
-        assert self.check_log_count(amo.LOG.REJECT_VERSION.id) == 1
-        assert self.check_log_count(amo.LOG.REJECT_CONTENT.id) == 0
+        if human_review:
+            assert self.check_log_count(amo.LOG.REJECT_VERSION.id) == 1
+            assert self.check_log_count(amo.LOG.REJECT_CONTENT.id) == 0
 
-        log = (
-            ActivityLog.objects.for_addons(self.addon)
-            .filter(action=amo.LOG.REJECT_VERSION.id)
-            .get()
-        )
-        assert log.arguments == [self.addon, self.review_version, old_version]
+            log = (
+                ActivityLog.objects.for_addons(self.addon)
+                .filter(action=amo.LOG.REJECT_VERSION.id)
+                .get()
+            )
+            decision = ContentDecision.objects.get()
+            assert log.arguments == [
+                self.addon,
+                decision,
+                self.review_version,
+                old_version,
+            ]
+            assert decision.metadata == {
+                'content_review': False,
+            }
 
-        # listed auto approvals should be disabled until the next manual approval.
-        flags = self.addon.reviewerflags
-        flags.reload()
-        assert not flags.auto_approval_disabled_until_next_approval_unlisted
-        assert flags.auto_approval_disabled_until_next_approval
+            # listed auto approvals should be disabled until the next manual
+            # approval.
+            flags = self.addon.reviewerflags
+            flags.reload()
+            assert not flags.auto_approval_disabled_until_next_approval_unlisted
+            assert flags.auto_approval_disabled_until_next_approval
+        else:
+            # For non-human, automatic rejections auto approvals should _not_
+            # be disabled until the next manual approval.
+            assert not AddonReviewerFlags.objects.filter(addon=self.addon).exists()
+            assert not self.addon.auto_approval_disabled_until_next_approval_unlisted
+            assert not self.addon.auto_approval_disabled_until_next_approval
 
     def test_reject_multiple_versions(self):
         self._test_reject_multiple_versions({})
         message = mail.outbox[0]
-        assert message.subject == (
-            'Mozilla Add-ons: Delicious Bookmarks has been disabled on '
-            'addons.mozilla.org'
-        )
-        assert 'your add-on Delicious Bookmarks has been disabled' in message.body
+        self.check_subject(message)
+        assert 'versions of your Extension have been disabled' in message.body
+        assert 'received from a third party' not in message.body
+
+    def test_reject_multiple_versions_non_human(self):
+        self._test_reject_multiple_versions({}, human_review=False)
 
     def test_reject_multiple_versions_resolving_abuse_report(self):
-        responses.add(
-            responses.POST,
-            f'{settings.CINDER_SERVER_URL}create_decision',
-            json={'uuid': '12345'},
-            status=201,
-        )
         cinder_job = CinderJob.objects.create(job_id='1')
+        NeedsHumanReview.objects.create(
+            version=self.review_version,
+            reason=NeedsHumanReview.REASONS.ABUSE_ADDON_VIOLATION,
+        )
         AbuseReport.objects.create(guid=self.addon.guid, cinder_job=cinder_job)
-        self._test_reject_multiple_versions({'resolve_cinder_jobs': [cinder_job]})
+        responses.add_callback(
+            responses.POST,
+            f'{settings.CINDER_SERVER_URL}jobs/1/decision',
+            callback=lambda r: (201, {}, json.dumps({'uuid': uuid.uuid4().hex})),
+        )
+        self._test_reject_multiple_versions({'cinder_jobs_to_resolve': [cinder_job]})
         message = mail.outbox[0]
-        assert message.subject == ('Mozilla Add-ons: Delicious Bookmarks [ref:12345]')
+        self.check_subject(message)
         assert 'Extension Delicious Bookmarks was manually reviewed' in message.body
         assert 'those versions of your Extension have been disabled' in message.body
+        assert 'received from a third party' in message.body
+        assert not NeedsHumanReview.objects.filter(is_active=True).exists()
 
-    def test_reject_multiple_versions_with_delay(self):
+    def _test_reject_multiple_versions_with_delay(self, extra_data):
         old_version = self.review_version
         self.review_version = version_factory(addon=self.addon, version='3.0')
         AutoApprovalSummary.objects.create(
@@ -2198,7 +2447,7 @@ class TestReviewHelper(TestReviewHelperBase):
         )
         self.setup_data(amo.STATUS_APPROVED, file_status=amo.STATUS_APPROVED)
 
-        in_the_future = datetime.now() + timedelta(days=14)
+        in_the_future = datetime.now() + timedelta(days=14, hours=1)
 
         # Safeguards.
         assert isinstance(self.helper.handler, ReviewFiles)
@@ -2206,14 +2455,13 @@ class TestReviewHelper(TestReviewHelperBase):
         assert self.file.status == amo.STATUS_APPROVED
         assert self.addon.current_version.is_public()
 
-        data = self.get_data().copy()
-        data.update(
-            {
-                'versions': self.addon.versions.all(),
-                'delayed_rejection': True,
-                'delayed_rejection_days': 14,
-            }
-        )
+        data = {
+            **self.get_data(),
+            'versions': self.addon.versions.all(),
+            'delayed_rejection': True,
+            'delayed_rejection_date': in_the_future,
+            **extra_data,
+        }
         self.helper.set_data(data)
         self.helper.handler.reject_multiple_versions()
 
@@ -2236,11 +2484,6 @@ class TestReviewHelper(TestReviewHelperBase):
         assert len(mail.outbox) == 1
         message = mail.outbox[0]
         assert message.to == [self.addon.authors.all()[0].email]
-        assert message.subject == (
-            'Mozilla Add-ons: Delicious Bookmarks will be disabled on '
-            'addons.mozilla.org'
-        )
-        assert 'your add-on Delicious Bookmarks will be disabled' in message.body
         log_token = ActivityLogToken.objects.get()
         assert log_token.uuid.hex in message.reply_to[0]
 
@@ -2254,7 +2497,12 @@ class TestReviewHelper(TestReviewHelperBase):
             .filter(action=amo.LOG.REJECT_VERSION_DELAYED.id)
             .get()
         )
-        assert log.arguments == [self.addon, self.review_version, old_version]
+        decision = ContentDecision.objects.get()
+        assert log.arguments == [self.addon, decision, self.review_version, old_version]
+        assert decision.metadata == {
+            'content_review': False,
+            'delayed_rejection_date': in_the_future.isoformat(),
+        }
 
         # The flag to prevent the authors from being notified several times
         # about pending rejections should have been reset, and auto approvals
@@ -2264,11 +2512,50 @@ class TestReviewHelper(TestReviewHelperBase):
         assert not flags.notified_about_expiring_delayed_rejections
         assert flags.auto_approval_disabled_until_next_approval
 
+    def test_reject_multiple_versions_with_delay(self):
+        self._test_reject_multiple_versions_with_delay({})
+        message = mail.outbox[0]
+        self.check_subject(message)
+        assert 'Your Extension Delicious Bookmarks was manually' in message.body
+        assert 'will be disabled' in message.body
+
+    def test_reject_multiple_versions_with_delay_resolving_abuse_reports(self):
+        cinder_job = CinderJob.objects.create(job_id='1')
+        NeedsHumanReview.objects.create(
+            version=self.review_version,
+            reason=NeedsHumanReview.REASONS.ABUSE_ADDON_VIOLATION,
+        )
+        AbuseReport.objects.create(guid=self.addon.guid, cinder_job=cinder_job)
+        responses.add_callback(
+            responses.POST,
+            f'{settings.CINDER_SERVER_URL}jobs/1/decision',
+            callback=lambda r: (201, {}, json.dumps({'uuid': uuid.uuid4().hex})),
+        )
+        self._test_reject_multiple_versions_with_delay(
+            {'cinder_jobs_to_resolve': [cinder_job]}
+        )
+        message = mail.outbox[0]
+        self.check_subject(message)
+        assert 'Your Extension Delicious Bookmarks was manually' in message.body
+        assert 'will be disabled' in message.body
+        log = (
+            ActivityLog.objects.for_addons(self.addon)
+            .filter(action=amo.LOG.REJECT_VERSION_DELAYED.id)
+            .get()
+        )
+        assert log.details['delayed_rejection_days'] == 14
+        assert set(cinder_job.reload().pending_rejections.all()) == set(
+            VersionReviewerFlags.objects.filter(version__in=self.addon.versions.all())
+        )
+        assert not NeedsHumanReview.objects.filter(is_active=True).exists()
+
     def test_reject_multiple_versions_except_latest(self):
         old_version = self.review_version
         extra_version = version_factory(addon=self.addon, version='3.1')
         # Add yet another version we don't want to reject.
-        self.review_version = version_factory(addon=self.addon, version='42.0')
+        self.review_version = version_factory(
+            addon=self.addon, version=amo.DEFAULT_WEBEXT_MIN_VERSION
+        )
         AutoApprovalSummary.objects.create(
             version=self.review_version, verdict=amo.AUTO_APPROVED, weight=91
         )
@@ -2300,11 +2587,11 @@ class TestReviewHelper(TestReviewHelperBase):
         assert len(mail.outbox) == 1
         message = mail.outbox[0]
         assert message.to == [self.addon.authors.all()[0].email]
-        assert message.subject == (
-            'Mozilla Add-ons: Versions disabled for Delicious Bookmarks'
-        )
-        assert 'Version(s) affected and disabled:\n3.1, 2.1.072' in message.body
-        log_token = ActivityLogToken.objects.filter(version=self.review_version).get()
+        self.check_subject(message)
+        assert 'Your Extension Delicious Bookmarks was manually' in message.body
+        assert 'versions of your Extension have been disabled' in message.body
+        assert 'Affected versions: 2.1.072, 3.1' in message.body
+        log_token = ActivityLogToken.objects.filter(version=extra_version).get()
         assert log_token.uuid.hex in message.reply_to[0]
 
         assert self.check_log_count(amo.LOG.REJECT_VERSION.id) == 1
@@ -2366,16 +2653,18 @@ class TestReviewHelper(TestReviewHelperBase):
         assert len(mail.outbox) == 1
         message = mail.outbox[0]
         assert message.to == [self.addon.authors.all()[0].email]
-        assert message.subject == (
-            'Mozilla Add-ons: Delicious Bookmarks has been disabled on '
-            'addons.mozilla.org'
-        )
-        assert 'your add-on Delicious Bookmarks has been disabled' in message.body
+        self.check_subject(message)
+        assert 'Your Extension Delicious Bookmarks was manually' in message.body
+        assert 'have been disabled' in message.body
         log_token = ActivityLogToken.objects.get()
         assert log_token.uuid.hex in message.reply_to[0]
 
         assert self.check_log_count(amo.LOG.REJECT_VERSION.id) == 0
         assert self.check_log_count(amo.LOG.REJECT_CONTENT.id) == 1
+
+        assert ContentDecision.objects.get().metadata == {
+            'content_review': True,
+        }
 
     def test_reject_multiple_versions_content_review_with_delay(self):
         self.grant_permission(self.user, 'Addons:ContentReview')
@@ -2385,7 +2674,7 @@ class TestReviewHelper(TestReviewHelperBase):
             amo.STATUS_APPROVED, file_status=amo.STATUS_APPROVED, content_review=True
         )
 
-        in_the_future = datetime.now() + timedelta(days=14)
+        in_the_future = datetime.now() + timedelta(days=14, hours=1)
 
         # Safeguards.
         assert isinstance(self.helper.handler, ReviewFiles)
@@ -2398,7 +2687,7 @@ class TestReviewHelper(TestReviewHelperBase):
             {
                 'versions': self.addon.versions.all(),
                 'delayed_rejection': True,
-                'delayed_rejection_days': 14,
+                'delayed_rejection_date': in_the_future,
             }
         )
         self.helper.set_data(data)
@@ -2420,11 +2709,9 @@ class TestReviewHelper(TestReviewHelperBase):
         assert len(mail.outbox) == 1
         message = mail.outbox[0]
         assert message.to == [self.addon.authors.all()[0].email]
-        assert message.subject == (
-            'Mozilla Add-ons: Delicious Bookmarks will be disabled on '
-            'addons.mozilla.org'
-        )
-        assert 'your add-on Delicious Bookmarks will be disabled' in message.body
+        self.check_subject(message)
+        assert 'Your Extension Delicious Bookmarks was manually' in message.body
+        assert 'will be disabled' in message.body
         log_token = ActivityLogToken.objects.get()
         assert log_token.uuid.hex in message.reply_to[0]
 
@@ -2438,7 +2725,12 @@ class TestReviewHelper(TestReviewHelperBase):
             .filter(action=amo.LOG.REJECT_CONTENT_DELAYED.id)
             .get()
         )
-        assert log.arguments == [self.addon, self.review_version, old_version]
+        decision = ContentDecision.objects.get()
+        assert log.arguments == [self.addon, decision, self.review_version, old_version]
+        assert decision.metadata == {
+            'content_review': True,
+            'delayed_rejection_date': in_the_future.isoformat(),
+        }
 
     def test_unreject_latest_version_approved_addon(self):
         first_version = self.review_version
@@ -2531,16 +2823,32 @@ class TestReviewHelper(TestReviewHelperBase):
 
         assert self.check_log_count(amo.LOG.UNREJECT_VERSION.id) == 1
 
-    def test_approve_multiple_versions_unlisted(self):
-        old_version = self.review_version
+    def _approve_multiple_versions_unlisted(self):
         self.make_addon_unlisted(self.addon)
+        old_version = self.review_version.reload()
+        version_pending_rejection = version_factory(
+            addon=self.addon,
+            version='2.99',
+            channel=amo.CHANNEL_UNLISTED,
+            file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+        )
+        VersionReviewerFlags.objects.create(
+            version=version_pending_rejection,
+            pending_rejection=datetime.now() + timedelta(days=1),
+            pending_rejection_by=self.user,
+            pending_content_rejection=False,
+        )
         self.review_version = version_factory(
             addon=self.addon,
             version='3.0',
             channel=amo.CHANNEL_UNLISTED,
             file_kw={'status': amo.STATUS_AWAITING_REVIEW},
         )
-        self.setup_data(amo.STATUS_NULL, file_status=amo.STATUS_AWAITING_REVIEW)
+        self.setup_data(
+            amo.STATUS_NULL,
+            file_status=amo.STATUS_AWAITING_REVIEW,
+            channel=amo.CHANNEL_UNLISTED,
+        )
         AddonReviewerFlags.objects.create(
             addon=self.addon,
             auto_approval_disabled_until_next_approval=True,
@@ -2552,18 +2860,54 @@ class TestReviewHelper(TestReviewHelperBase):
         assert self.addon.status == amo.STATUS_NULL
         assert self.file.status == amo.STATUS_AWAITING_REVIEW
 
+        expected_versions = [
+            self.review_version,
+            version_pending_rejection,
+            old_version,
+        ]
         data = self.get_data().copy()
-        data['versions'] = self.addon.versions.all()
+        data['versions'] = expected_versions
         self.helper.set_data(data)
         self.helper.handler.approve_multiple_versions()
+        return expected_versions
 
+    def test_approve_multiple_versions_unlisted_skipped_version_awaiting_review(self):
+        wont_be_approved_version = version_factory(
+            addon=self.addon,
+            version='1.987',
+            channel=amo.CHANNEL_UNLISTED,
+            file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+        )
+        self._approve_multiple_versions_unlisted()
+        # This version wasn't part of the version we're approving so it should
+        # not have changed status, and shouldn't get a human review date.
+        assert wont_be_approved_version.reload().human_review_date is None
+        assert (
+            wont_be_approved_version.file.reload().status == amo.STATUS_AWAITING_REVIEW
+        )
+
+    def test_approve_multiple_versions_unlisted(self):
+        expected_versions = self._approve_multiple_versions_unlisted()
+        for version in expected_versions:
+            version.reload()
+            version.file.reload()
+            try:
+                version.reviewerflags.reload()
+            except VersionReviewerFlags.DoesNotExist:
+                pass
+            assert version.file.status == amo.STATUS_APPROVED
+            self.assertCloseToNow(version.human_review_date)
+            assert version.pending_rejection is None
+            assert version.pending_content_rejection is None
+            assert version.pending_rejection_by is None
+
+    def test_approve_multiple_versions_unlisted_flags_activity_logs_and_emails(self):
+        expected_versions = self._approve_multiple_versions_unlisted()
         self.addon.reload()
         self.file.reload()
         assert self.addon.status == amo.STATUS_NULL
         assert self.addon.current_version is None
-        assert list(self.addon.versions.all()) == [self.review_version, old_version]
         assert self.file.status == amo.STATUS_APPROVED
-
         # unlisted auto approvals should be enabled again
         flags = self.addon.reviewerflags
         flags.reload()
@@ -2573,13 +2917,8 @@ class TestReviewHelper(TestReviewHelperBase):
         assert len(mail.outbox) == 1
         message = mail.outbox[0]
         assert message.to == [self.addon.authors.all()[0].email]
-        assert message.subject == (
-            'Mozilla Add-ons: Delicious Bookmarks signed and ready to download'
-        )
-        assert (
-            'versions of your add-on Delicious Bookmarks are now signed '
-            in message.body
-        )
+        self.check_subject(message)
+        assert 'has been approved' in message.body
         log_token = ActivityLogToken.objects.get()
         assert log_token.uuid.hex in message.reply_to[0]
 
@@ -2591,7 +2930,12 @@ class TestReviewHelper(TestReviewHelperBase):
             .filter(action=amo.LOG.APPROVE_VERSION.id)
             .get()
         )
-        assert log.arguments == [self.addon, self.review_version, old_version]
+        decision = ContentDecision.objects.get()
+        assert log.arguments == [
+            self.addon,
+            *expected_versions,
+            decision,
+        ]
 
     def test_reject_multiple_versions_unlisted(self):
         old_version = self.review_version
@@ -2633,13 +2977,8 @@ class TestReviewHelper(TestReviewHelperBase):
         assert len(mail.outbox) == 1
         message = mail.outbox[0]
         assert message.to == [self.addon.authors.all()[0].email]
-        assert message.subject == (
-            'Mozilla Add-ons: Versions disabled for Delicious Bookmarks'
-        )
-        assert (
-            'versions of your add-on Delicious Bookmarks have been disabled'
-            in message.body
-        )
+        self.check_subject(message)
+        assert 'versions of your Extension have been disabled' in message.body
         log_token = ActivityLogToken.objects.get()
         assert log_token.uuid.hex in message.reply_to[0]
 
@@ -2651,7 +2990,8 @@ class TestReviewHelper(TestReviewHelperBase):
             .filter(action=amo.LOG.REJECT_VERSION.id)
             .get()
         )
-        assert log.arguments == [self.addon, self.review_version, old_version]
+        decision = ContentDecision.objects.get()
+        assert log.arguments == [self.addon, decision, self.review_version, old_version]
 
     def _setup_reject_multiple_versions_delayed(self, content_review):
         # Do a rejection with delay.
@@ -2669,12 +3009,14 @@ class TestReviewHelper(TestReviewHelperBase):
 
         assert self.addon.status == amo.STATUS_APPROVED
 
+        in_the_future = datetime.now() + timedelta(days=14, hours=1)
+
         data = self.get_data().copy()
         data.update(
             {
                 'versions': self.addon.versions.all(),
                 'delayed_rejection': True,
-                'delayed_rejection_days': 14,
+                'delayed_rejection_date': in_the_future,
             }
         )
         self.helper.set_data(data)
@@ -2701,7 +3043,8 @@ class TestReviewHelper(TestReviewHelperBase):
             .filter(action=delayed_action.id)
             .get()
         )
-        assert log.arguments == [self.addon, self.review_version, old_version]
+        decision = ContentDecision.objects.get()
+        assert log.arguments == [self.addon, decision, self.review_version, old_version]
         # The request user is recorded as scheduling the rejection.
         assert log.user == original_user
 
@@ -2718,13 +3061,15 @@ class TestReviewHelper(TestReviewHelperBase):
         # Clear our the ActivityLogs.
         ActivityLog.objects.all().delete()
 
-        self.helper.handler.reject_multiple_versions()
+        self.helper.handler.auto_reject_multiple_versions()
 
         self.addon.reload()
         assert self.addon.status == amo.STATUS_NULL
 
         action = (
-            amo.LOG.REJECT_VERSION if not content_review else amo.LOG.REJECT_CONTENT
+            amo.LOG.AUTO_REJECT_VERSION_AFTER_DELAY_EXPIRED
+            if not content_review
+            else amo.LOG.AUTO_REJECT_CONTENT_AFTER_DELAY_EXPIRED
         )
         # The request user is recorded as scheduling the rejection.
         assert self.check_log_count(action.id, original_user) == 1
@@ -2799,57 +3144,44 @@ class TestReviewHelper(TestReviewHelperBase):
         assert activity.details['comments'] == ''
         assert not self.review_version.human_review_date
 
-    def test_dev_versions_url_in_context(self):
-        self.helper.set_data(self.get_data())
-        context_data = self.helper.handler.get_context_data()
-        assert context_data['dev_versions_url'] == absolutify(
-            self.addon.get_dev_url('versions')
-        )
-
-        self.review_version.update(channel=amo.CHANNEL_UNLISTED)
-        context_data = self.helper.handler.get_context_data()
-        assert context_data['dev_versions_url'] == absolutify(
-            reverse('devhub.addons.versions', args=[self.addon.id])
-        )
-
     def test_nominated_to_approved_recommended(self):
-        self.make_addon_promoted(self.addon, RECOMMENDED)
+        self.make_addon_promoted(self.addon, PROMOTED_GROUP_CHOICES.RECOMMENDED)
         assert not self.addon.promoted_group()
         self.test_nomination_to_public()
         assert self.addon.current_version.promoted_approvals.filter(
-            group_id=RECOMMENDED.id
+            group_id=PROMOTED_GROUP_CHOICES.RECOMMENDED
         ).exists()
-        assert self.addon.promoted_group() == RECOMMENDED
+        assert self.addon.promoted_group().id == PROMOTED_GROUP_CHOICES.RECOMMENDED
 
     def test_nominated_to_approved_other_promoted(self):
-        self.make_addon_promoted(self.addon, LINE)
+        self.make_addon_promoted(self.addon, PROMOTED_GROUP_CHOICES.LINE)
         assert not self.addon.promoted_group()
         self.test_nomination_to_public()
         assert self.addon.current_version.promoted_approvals.filter(
-            group_id=LINE.id
+            group_id=PROMOTED_GROUP_CHOICES.LINE
         ).exists()
-        assert self.addon.promoted_group() == LINE
+        assert self.addon.promoted_group().id == PROMOTED_GROUP_CHOICES.LINE
 
     def test_approved_update_recommended(self):
-        self.make_addon_promoted(self.addon, RECOMMENDED)
+        self.make_addon_promoted(self.addon, PROMOTED_GROUP_CHOICES.RECOMMENDED)
         assert not self.addon.promoted_group()
         self.test_public_addon_with_version_awaiting_review_to_public()
         assert self.addon.current_version.promoted_approvals.filter(
-            group_id=RECOMMENDED.id
+            group_id=PROMOTED_GROUP_CHOICES.RECOMMENDED
         ).exists()
-        assert self.addon.promoted_group() == RECOMMENDED
+        assert self.addon.promoted_group().id == PROMOTED_GROUP_CHOICES.RECOMMENDED
 
     def test_approved_update_other_promoted(self):
-        self.make_addon_promoted(self.addon, LINE)
+        self.make_addon_promoted(self.addon, PROMOTED_GROUP_CHOICES.LINE)
         assert not self.addon.promoted_group()
         self.test_public_addon_with_version_awaiting_review_to_public()
         assert self.addon.current_version.promoted_approvals.filter(
-            group_id=LINE.id
+            group_id=PROMOTED_GROUP_CHOICES.LINE
         ).exists()
-        assert self.addon.promoted_group() == LINE
+        assert self.addon.promoted_group().id == PROMOTED_GROUP_CHOICES.LINE
 
     def test_autoapprove_fails_for_promoted(self):
-        self.make_addon_promoted(self.addon, RECOMMENDED)
+        self.make_addon_promoted(self.addon, PROMOTED_GROUP_CHOICES.RECOMMENDED)
         assert not self.addon.promoted_group()
         self.user = UserProfile.objects.get(id=settings.TASK_USER_ID)
 
@@ -2861,7 +3193,7 @@ class TestReviewHelper(TestReviewHelperBase):
         assert not self.addon.promoted_group()
 
         # change to other type of promoted; same should happen
-        self.addon.promotedaddon.update(group_id=LINE.id)
+        self.addon.promotedaddon.update(group_id=PROMOTED_GROUP_CHOICES.LINE)
         with self.assertRaises(AssertionError):
             self.test_nomination_to_public()
         assert not PromotedApproval.objects.filter(
@@ -2870,14 +3202,14 @@ class TestReviewHelper(TestReviewHelperBase):
         assert not self.addon.promoted_group()
 
         # except for a group that doesn't require prereview
-        self.addon.promotedaddon.update(group_id=STRATEGIC.id)
-        assert self.addon.promoted_group() == STRATEGIC
+        self.addon.promotedaddon.update(group_id=PROMOTED_GROUP_CHOICES.STRATEGIC)
+        assert self.addon.promoted_group().id == PROMOTED_GROUP_CHOICES.STRATEGIC
         self.test_nomination_to_public()
         # But no promotedapproval though
         assert not PromotedApproval.objects.filter(
             version=self.addon.current_version
         ).exists()
-        assert self.addon.promoted_group() == STRATEGIC
+        assert self.addon.promoted_group().id == PROMOTED_GROUP_CHOICES.STRATEGIC
 
     def _test_block_multiple_unlisted_versions(self, redirect_url):
         old_version = self.review_version
@@ -3019,6 +3351,38 @@ class TestReviewHelper(TestReviewHelperBase):
         assert not flags.reload().needs_human_review_by_mad
         assert not self.review_version.needs_human_review_by_mad
 
+    def test_clear_needs_human_review_multiple_versions_not_abuse(self):
+        self.setup_data(amo.STATUS_APPROVED, file_status=amo.STATUS_APPROVED)
+        NeedsHumanReview.objects.create(version=self.review_version)
+        # abuse or appeal related NHR are cleared in ContentDecision so aren't cleared
+        NeedsHumanReview.objects.create(
+            version=self.review_version,
+            reason=NeedsHumanReview.REASONS.ABUSE_ADDON_VIOLATION,
+        )
+
+        data = self.get_data().copy()
+        data['versions'] = (
+            self.addon.versions(manager='unfiltered_for_relations').all().order_by('pk')
+        )
+        self.helper.set_data(data)
+        self.helper.handler.clear_needs_human_review_multiple_versions()
+
+        log_type_id = amo.LOG.CLEAR_NEEDS_HUMAN_REVIEW.id
+        assert self.check_log_count(log_type_id) == 1
+        assert ActivityLog.objects.for_addons(self.helper.addon).get(
+            action=log_type_id
+        ).details.get('versions') == [self.review_version.version]
+        assert len(mail.outbox) == 0
+        self.review_version.reload()
+        assert not self.review_version.human_review_date  # its not been reviewed
+        assert self.review_version.needshumanreview_set.filter(is_active=True).exists()
+        assert (
+            not self.review_version.needshumanreview_set.filter(is_active=True)
+            .exclude(reason__in=NeedsHumanReview.REASONS.ABUSE_OR_APPEAL_RELATED.values)
+            .exists()
+        )
+        assert self.review_version.due_date
+
     def test_set_needs_human_review_multiple_versions(self):
         self.setup_data(amo.STATUS_APPROVED, file_status=amo.STATUS_APPROVED)
         selected = version_factory(addon=self.review_version.addon)
@@ -3090,7 +3454,7 @@ class TestReviewHelper(TestReviewHelperBase):
             .exclude(pk=unselected.pk)
             .order_by('pk')
         )
-        data['action'] = 'clear_pending_rejection_multiple_versions'
+        data['action'] = 'change_or_clear_pending_rejection_multiple_versions'
         self.helper.set_data(data)
         self.helper.process()
 
@@ -3127,6 +3491,93 @@ class TestReviewHelper(TestReviewHelperBase):
         assert unselected.reviewerflags.pending_rejection_by
         assert unselected.reviewerflags.pending_rejection is not None
 
+    def test_change_pending_rejection_multiple_versions(self):
+        self.grant_permission(self.user, 'Addons:Review')
+        self.grant_permission(self.user, 'Reviews:Admin')
+        self.setup_data(amo.STATUS_APPROVED, file_status=amo.STATUS_APPROVED)
+        old_pending_rejection_date = datetime.now() + timedelta(days=1)
+        VersionReviewerFlags.objects.create(
+            version=self.review_version,
+            pending_rejection=old_pending_rejection_date,
+            pending_rejection_by=self.user,
+            pending_content_rejection=False,
+        )
+        selected = version_factory(addon=self.review_version.addon)
+        VersionReviewerFlags.objects.create(
+            version=selected,
+            pending_rejection=old_pending_rejection_date,
+            pending_rejection_by=self.user,
+            pending_content_rejection=True,
+        )
+        unselected = version_factory(addon=self.review_version.addon)
+        VersionReviewerFlags.objects.create(
+            version=unselected,
+            pending_rejection=old_pending_rejection_date,
+            pending_rejection_by=self.user,
+            pending_content_rejection=False,
+        )
+        in_the_future = datetime.now().replace(second=0, microsecond=0) + timedelta(
+            days=15
+        )
+        data = self.get_data().copy()
+        data['versions'] = (
+            self.addon.versions(manager='unfiltered_for_relations')
+            .all()
+            .exclude(pk=unselected.pk)
+            .order_by('pk')
+        )
+        data['action'] = 'change_or_clear_pending_rejection_multiple_versions'
+        data['delayed_rejection'] = 'True'
+        data['delayed_rejection_date'] = in_the_future
+        self.helper.set_data(data)
+        self.helper.process()
+
+        old_deadline = old_pending_rejection_date.isoformat()[:16]
+        new_deadline = in_the_future.isoformat()[:16]
+        log_type_id = amo.LOG.CHANGE_PENDING_REJECTION.id
+        assert self.check_log_count(log_type_id) == 1
+        activity = ActivityLog.objects.for_addons(self.helper.addon).get(
+            action=log_type_id
+        )
+        assert activity.details['comments'] == ''
+        assert activity.details['versions'] == [
+            self.review_version.version,
+            selected.version,
+        ]
+        assert activity.details['old_deadline'] == old_deadline
+        assert activity.details['new_deadline'] == new_deadline
+        assert len(mail.outbox) == 1
+        assert (
+            'Our previous correspondence indicated that you would be required '
+            f'to correct the violation(s) by {old_deadline}.'
+        ) in mail.outbox[0].body
+        assert (
+            'will now require you to correct your add-on violations no later '
+            f'than {new_deadline}'
+        ) in mail.outbox[0].body
+
+        self.review_version.reload()
+        self.review_version.reviewerflags.reload()
+        assert not self.review_version.human_review_date
+        assert self.review_version.reviewerflags.pending_content_rejection is False
+        assert self.review_version.reviewerflags.pending_rejection_by == self.user
+        assert self.review_version.reviewerflags.pending_rejection == in_the_future
+
+        selected.reload()
+        selected.reviewerflags.reload()
+        assert not selected.human_review_date
+        assert selected.reviewerflags.pending_content_rejection is True
+        assert selected.reviewerflags.pending_rejection_by == self.user
+        assert selected.reviewerflags.pending_rejection == in_the_future
+
+        unselected.reload()
+        unselected.reviewerflags.reload()
+        assert not unselected.human_review_date
+        assert unselected.reviewerflags.pending_content_rejection is False
+        assert unselected.reviewerflags.pending_rejection_by
+        assert unselected.reviewerflags.pending_rejection
+        assert unselected.reviewerflags.pending_rejection != in_the_future
+
     def test_disable_addon(self):
         self.grant_permission(self.user, 'Reviews:Admin')
         self.setup_data(amo.STATUS_APPROVED, file_status=amo.STATUS_APPROVED)
@@ -3141,7 +3592,7 @@ class TestReviewHelper(TestReviewHelperBase):
 
         assert len(mail.outbox) == 1
         message = mail.outbox[0]
-        assert message.subject == ('%s has been disabled' % self.preamble)
+        self.check_subject(message)
         assert 'disabled' in message.body
 
     def test_enable_addon(self):
@@ -3156,7 +3607,10 @@ class TestReviewHelper(TestReviewHelperBase):
         assert activity_log.action == amo.LOG.FORCE_ENABLE.id
         assert activity_log.arguments[0] == self.addon
 
-        assert len(mail.outbox) == 0
+        assert len(mail.outbox) == 1
+        message = mail.outbox[0]
+        self.check_subject(message)
+        assert 'approved' in message.body
 
     def test_enable_addon_no_public_versions_should_fall_back_to_incomplete(self):
         self.grant_permission(self.user, 'Reviews:Admin')
@@ -3167,7 +3621,7 @@ class TestReviewHelper(TestReviewHelperBase):
 
         self.addon.reload()
         assert self.addon.status == amo.STATUS_NULL
-        assert len(mail.outbox) == 0
+        assert len(mail.outbox) == 1
 
     def test_enable_addon_version_is_awaiting_review_fall_back_to_nominated(self):
         self.grant_permission(self.user, 'Reviews:Admin')
@@ -3177,78 +3631,556 @@ class TestReviewHelper(TestReviewHelperBase):
 
         self.addon.reload()
         assert self.addon.status == amo.STATUS_NOMINATED
-        assert len(mail.outbox) == 0
+        assert len(mail.outbox) == 1
 
-    def _resolve_abuse_reports_called_everywhere_checkbox_shown(self, channel, actions):
-        # these two functions are to verify we call log_action before it's accessed
-        def log_check(decision):
-            assert self.helper.handler.log_entry
+    def _record_decision_called_everywhere_checkbox_shown(self, actions):
+        job, _ = CinderJob.objects.get_or_create(job_id='1234')
+        policy, _ = CinderPolicy.objects.get_or_create(
+            default_cinder_action=DECISION_ACTIONS.AMO_APPROVE
+        )
+        self.helper.handler.data = {
+            'versions': [self.review_version],
+            'cinder_jobs_to_resolve': [job],
+            'cinder_policies': [policy],
+        }
+        all_actions = self.helper.actions
+        resolves_actions = {
+            key: action
+            for key, action in all_actions.items()
+            if action.get('resolves_cinder_jobs', False)
+        }
+        assert list(resolves_actions) == list(actions)
 
-        def log_action(*args, **kwargs):
-            self.helper.handler.log_entry = object()
+        responses.add(
+            responses.POST,
+            f'{settings.CINDER_SERVER_URL}create_report',
+            json={'job_id': uuid.uuid4().hex},
+            status=201,
+        )
 
+        with (
+            patch(
+                'olympia.reviewers.utils.report_decision_to_cinder_and_notify.delay'
+            ) as report_task_mock,
+            patch.object(self.helper.handler, 'log_action') as reviewer_log_mock,
+            patch('olympia.abuse.actions.log_create') as content_action_log_mock,
+        ):
+            reviewer_log_mock.return_value = None
+            content_action_log_mock.return_value = None
+            for action_name, action in resolves_actions.items():
+                self.helper.handler.review_action = all_actions[action_name]
+                action['method']()
+
+                decision = ContentDecision.objects.get()
+                report_task_mock.assert_called_once_with(decision_id=decision.id)
+                report_task_mock.reset_mock()
+                if not actions[action_name].get('uses_content_action', False):
+                    reviewer_log_mock.assert_called_once()
+                    activity_class = reviewer_log_mock.call_args.args[0]
+                    content_action_log_mock.assert_not_called()
+                else:
+                    content_action_log_mock.assert_called_once()
+                    activity_class = content_action_log_mock.call_args[0][0]
+                    reviewer_log_mock.assert_not_called()
+                assert (
+                    getattr(activity_class, 'hide_developer', False)
+                    != actions[action_name]['should_email']
+                )
+                assert (
+                    decision.action == actions[action_name]['cinder_action']
+                    or policy.default_cinder_action
+                )
+                assert job.decision == decision
+
+                job.update(decision=None)
+                decision.delete()
+                reviewer_log_mock.reset_mock()
+                content_action_log_mock.reset_mock()
+                self.helper.handler.version = self.review_version
+
+    def test_record_decision_called_everywhere_checkbox_shown_listed(self):
+        self.grant_permission(self.user, 'Reviews:Admin')
+        self.grant_permission(self.user, 'Addons:Review')
+        AutoApprovalSummary.objects.create(
+            version=self.review_version, verdict=amo.AUTO_APPROVED, weight=42
+        )
+        CinderJob.objects.create(
+            target_addon=self.addon, resolvable_in_reviewer_tools=True
+        )
+        self.setup_data(amo.STATUS_APPROVED)
+        self._record_decision_called_everywhere_checkbox_shown(
+            {
+                'public': {
+                    'should_email': True,
+                    'cinder_action': DECISION_ACTIONS.AMO_APPROVE_VERSION,
+                },
+                'reject': {
+                    'should_email': True,
+                    'uses_content_action': True,
+                    'cinder_action': DECISION_ACTIONS.AMO_REJECT_VERSION_ADDON,
+                },
+                'confirm_auto_approved': {
+                    'should_email': False,
+                    'cinder_action': DECISION_ACTIONS.AMO_APPROVE,
+                },
+                'reject_multiple_versions': {
+                    'should_email': True,
+                    'uses_content_action': True,
+                    'cinder_action': DECISION_ACTIONS.AMO_REJECT_VERSION_ADDON,
+                },
+                'disable_addon': {
+                    'should_email': True,
+                    'uses_content_action': True,
+                    'cinder_action': DECISION_ACTIONS.AMO_DISABLE_ADDON,
+                },
+                'resolve_reports_job': {'should_email': False, 'cinder_action': None},
+                'request_legal_review': {
+                    'should_email': False,
+                    'uses_content_action': True,
+                    'cinder_action': DECISION_ACTIONS.AMO_LEGAL_FORWARD,
+                },
+            }
+        )
+        self.setup_data(amo.STATUS_APPROVED, file_status=amo.STATUS_DISABLED)
+        assert self.addon.status == amo.STATUS_APPROVED
+        self._record_decision_called_everywhere_checkbox_shown(
+            {
+                'confirm_auto_approved': {
+                    'should_email': False,
+                    'cinder_action': DECISION_ACTIONS.AMO_APPROVE,
+                },
+                'reject_multiple_versions': {
+                    'should_email': True,
+                    'uses_content_action': True,
+                    'cinder_action': DECISION_ACTIONS.AMO_REJECT_VERSION_ADDON,
+                },
+                'disable_addon': {
+                    'should_email': True,
+                    'uses_content_action': True,
+                    'cinder_action': DECISION_ACTIONS.AMO_DISABLE_ADDON,
+                },
+                'resolve_reports_job': {'should_email': False, 'cinder_action': None},
+                'request_legal_review': {
+                    'should_email': False,
+                    'uses_content_action': True,
+                    'cinder_action': DECISION_ACTIONS.AMO_LEGAL_FORWARD,
+                },
+            }
+        )
+        self.setup_data(amo.STATUS_DISABLED, file_status=amo.STATUS_DISABLED)
+        self._record_decision_called_everywhere_checkbox_shown(
+            {
+                'confirm_auto_approved': {
+                    'should_email': False,
+                    'cinder_action': DECISION_ACTIONS.AMO_APPROVE,
+                },
+                'enable_addon': {
+                    'should_email': True,
+                    'cinder_action': DECISION_ACTIONS.AMO_APPROVE_VERSION,
+                },
+                'resolve_reports_job': {'should_email': False, 'cinder_action': None},
+                'request_legal_review': {
+                    'should_email': False,
+                    'uses_content_action': True,
+                    'cinder_action': DECISION_ACTIONS.AMO_LEGAL_FORWARD,
+                },
+            }
+        )
+
+    def test_record_decision_called_everywhere_checkbox_shown_unlisted(self):
         self.grant_permission(self.user, 'Reviews:Admin')
         self.grant_permission(self.user, 'Addons:Review')
         self.grant_permission(self.user, 'Addons:ReviewUnlisted')
         AutoApprovalSummary.objects.create(
             version=self.review_version, verdict=amo.AUTO_APPROVED, weight=42
         )
-        self.setup_data(amo.STATUS_APPROVED, channel=channel)
-        self.helper.handler.data = {'versions': [self.review_version]}
-        resolves_actions = {
-            key: action
-            for key, action in self.helper.actions.items()
-            if action.get('resolves_abuse_reports', False)
+        CinderJob.objects.create(
+            target_addon=self.addon, resolvable_in_reviewer_tools=True
+        )
+        self.setup_data(amo.STATUS_APPROVED, channel=amo.CHANNEL_UNLISTED)
+        self._record_decision_called_everywhere_checkbox_shown(
+            {
+                'public': {
+                    'should_email': True,
+                    'cinder_action': DECISION_ACTIONS.AMO_APPROVE_VERSION,
+                },
+                'approve_multiple_versions': {
+                    'should_email': True,
+                    'cinder_action': DECISION_ACTIONS.AMO_APPROVE_VERSION,
+                },
+                'reject_multiple_versions': {
+                    'should_email': True,
+                    'uses_content_action': True,
+                    'cinder_action': DECISION_ACTIONS.AMO_REJECT_VERSION_ADDON,
+                },
+                'confirm_multiple_versions': {
+                    'should_email': False,
+                    'cinder_action': DECISION_ACTIONS.AMO_APPROVE,
+                },
+                'disable_addon': {
+                    'should_email': True,
+                    'uses_content_action': True,
+                    'cinder_action': DECISION_ACTIONS.AMO_DISABLE_ADDON,
+                },
+                'resolve_reports_job': {'should_email': False, 'cinder_action': None},
+                'request_legal_review': {
+                    'should_email': False,
+                    'uses_content_action': True,
+                    'cinder_action': DECISION_ACTIONS.AMO_LEGAL_FORWARD,
+                },
+            }
+        )
+        self.setup_data(amo.STATUS_DISABLED, file_status=amo.STATUS_DISABLED)
+        self._record_decision_called_everywhere_checkbox_shown(
+            {
+                'approve_multiple_versions': {
+                    'should_email': True,
+                    'cinder_action': DECISION_ACTIONS.AMO_APPROVE_VERSION,
+                },
+                'reject_multiple_versions': {
+                    'should_email': True,
+                    'uses_content_action': True,
+                    'cinder_action': DECISION_ACTIONS.AMO_REJECT_VERSION_ADDON,
+                },
+                'confirm_multiple_versions': {
+                    'should_email': False,
+                    'cinder_action': DECISION_ACTIONS.AMO_APPROVE,
+                },
+                'enable_addon': {
+                    'should_email': True,
+                    'cinder_action': DECISION_ACTIONS.AMO_APPROVE_VERSION,
+                },
+                'resolve_reports_job': {'should_email': False, 'cinder_action': None},
+                'request_legal_review': {
+                    'should_email': False,
+                    'uses_content_action': True,
+                    'cinder_action': DECISION_ACTIONS.AMO_LEGAL_FORWARD,
+                },
+            }
+        )
+
+    def test_resolve_appeal_job(self):
+        policy_a = CinderPolicy.objects.create(uuid='a')
+        policy_b = CinderPolicy.objects.create(uuid='b')
+        policy_c = CinderPolicy.objects.create(uuid='c')
+        policy_d = CinderPolicy.objects.create(uuid='d')
+
+        appeal_job1 = CinderJob.objects.create(
+            job_id='1', resolvable_in_reviewer_tools=True, target_addon=self.addon
+        )
+        ContentDecision.objects.create(
+            appeal_job=appeal_job1,
+            action=DECISION_ACTIONS.AMO_DISABLE_ADDON,
+            addon=self.addon,
+        ).policies.add(policy_a, policy_b)
+        ContentDecision.objects.create(
+            appeal_job=appeal_job1,
+            action=DECISION_ACTIONS.AMO_REJECT_VERSION_ADDON,
+            addon=self.addon,
+        ).policies.add(policy_a, policy_c)
+        responses.add_callback(
+            responses.POST,
+            f'{settings.CINDER_SERVER_URL}jobs/{appeal_job1.job_id}/decision',
+            callback=lambda r: (201, {}, json.dumps({'uuid': uuid.uuid4().hex})),
+        )
+
+        appeal_job2 = CinderJob.objects.create(
+            job_id='2', resolvable_in_reviewer_tools=True, target_addon=self.addon
+        )
+        ContentDecision.objects.create(
+            appeal_job=appeal_job2,
+            action=DECISION_ACTIONS.AMO_APPROVE,
+            addon=self.addon,
+        ).policies.add(policy_d)
+        responses.add_callback(
+            responses.POST,
+            f'{settings.CINDER_SERVER_URL}jobs/{appeal_job2.job_id}/decision',
+            callback=lambda r: (201, {}, json.dumps({'uuid': uuid.uuid4().hex})),
+        )
+
+        self.grant_permission(self.user, 'Addons:Review')
+        self.file.update(status=amo.STATUS_AWAITING_REVIEW)
+        self.helper = self.get_helper()
+        data = {
+            'comments': 'Nope',
+            'cinder_jobs_to_resolve': [appeal_job1, appeal_job2],
+            'appeal_action': ['deny'],
         }
-        should_email = dict(actions)
-        assert list(resolves_actions.keys()) == list(should_email)
+        self.helper.set_data(data)
 
-        self.helper.handler.notify_email = lambda *arg, **kwarg: None
-        with (
-            patch.object(
-                self.helper.handler, 'resolve_abuse_reports', wraps=log_check
-            ) as resolve_mock,
-            patch.object(
-                self.helper.handler, 'log_action', wraps=log_action
-            ) as log_action_mock,
+        self.helper.handler.resolve_appeal_job()
+
+        assert CinderPolicyLog.objects.count() == 4
+        activity_log_qs = ActivityLog.objects.filter(action=amo.LOG.DENY_APPEAL_JOB.id)
+        assert activity_log_qs.count() == 2
+        decision_qs = ContentDecision.objects.filter(action_date__isnull=False)
+        assert decision_qs.count() == 2
+        log2, log1 = list(activity_log_qs.all())
+        decision1, decision2 = list(decision_qs.all())
+        assert decision1.action == DECISION_ACTIONS.AMO_DISABLE_ADDON
+        assert decision2.action == DECISION_ACTIONS.AMO_APPROVE
+        assert decision1.activities.get() == log1
+        assert decision2.activities.get() == log2
+        assert set(appeal_job1.reload().decision.policies.all()) == {
+            policy_a,
+            policy_b,
+            policy_c,
+        }
+        assert set(appeal_job2.reload().decision.policies.all()) == {policy_d}
+
+    def test_reject_multiple_versions_resets_original_status_too(self):
+        old_version = self.review_version
+        old_version.file.update(
+            status=amo.STATUS_DISABLED,
+            original_status=amo.STATUS_APPROVED,
+            status_disabled_reason=File.STATUS_DISABLED_REASONS.DEVELOPER,
+        )
+        self.review_version = version_factory(
+            addon=self.addon,
+            version='3.0',
+            file_kw={
+                'status': amo.STATUS_DISABLED,
+                'original_status': amo.STATUS_AWAITING_REVIEW,
+                'status_disabled_reason': File.STATUS_DISABLED_REASONS.DEVELOPER,
+            },
+        )
+        self.file = self.review_version.file
+
+        data = self.get_data().copy()
+        data['versions'] = self.addon.versions.all()
+        self.helper.set_data(data)
+        self.helper.handler.reject_multiple_versions()
+
+        assert self.addon.reload().status == amo.STATUS_NULL
+
+        assert old_version.file.reload().status == amo.STATUS_DISABLED
+        assert self.review_version.file.reload().status == amo.STATUS_DISABLED
+        assert old_version.file.original_status == amo.STATUS_NULL
+        assert self.review_version.file.original_status == amo.STATUS_NULL
+        assert old_version.file.original_status == File.STATUS_DISABLED_REASONS.NONE
+        assert self.review_version.file.original_status == (
+            File.STATUS_DISABLED_REASONS.NONE
+        )
+
+    def _test_request_legal_review(self, *, data=None):
+        self.setup_data(
+            amo.STATUS_APPROVED,
+            file_status=amo.STATUS_APPROVED,
+        )
+        if data:
+            data = {**self.get_data(), **data}
+            self.helper.set_data(data)
+        report_request = responses.add(
+            responses.POST,
+            f'{settings.CINDER_SERVER_URL}create_report',
+            json={'job_id': '5678'},
+            status=201,
+        )
+        NeedsHumanReview.objects.create(
+            version=self.addon.current_version,
+            reason=NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED,
+            is_active=True,
+        )
+        self.helper.handler.request_legal_review()
+
+        assert len(mail.outbox) == 0
+        assert report_request.call_count == 1
+        assert CinderJob.objects.get(job_id='5678')
+        request_body = json.loads(responses.calls[0].request.body)
+        assert (
+            request_body['reasoning'] == data['comments']
+            if data
+            else self.get_data()['comments']
+        )
+        assert not NeedsHumanReview.objects.filter(
+            reason=NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED, is_active=True
+        ).exists()
+
+    def test_request_legal_review_no_job(self):
+        NeedsHumanReview.objects.create(
+            version=self.addon.current_version,
+            reason=NeedsHumanReview.REASONS.ABUSE_ADDON_VIOLATION,
+        )
+        self._test_request_legal_review()
+
+        # is not cleared
+        assert NeedsHumanReview.objects.filter(
+            reason=NeedsHumanReview.REASONS.ABUSE_ADDON_VIOLATION, is_active=True
+        ).exists()
+
+    def test_request_legal_review_resolve_job(self):
+        # Set up a typical job that would be handled in the reviewer tools
+        job = CinderJob.objects.create(
+            target_addon=self.addon, resolvable_in_reviewer_tools=True, job_id='1234'
+        )
+        AbuseReport.objects.create(guid=self.addon.guid, cinder_job=job)
+        responses.add_callback(
+            responses.POST,
+            f'{settings.CINDER_SERVER_URL}jobs/1234/decision',
+            callback=lambda r: (201, {}, json.dumps({'uuid': uuid.uuid4().hex})),
+        )
+        NeedsHumanReview.objects.create(
+            version=self.addon.current_version,
+            reason=NeedsHumanReview.REASONS.ABUSE_ADDON_VIOLATION,
+        )
+        self._test_request_legal_review(data={'cinder_jobs_to_resolve': [job]})
+
+        # And check that the job was resolved in the way we expected
+        assert job.reload().decision.action == DECISION_ACTIONS.AMO_LEGAL_FORWARD
+        assert job.forwarded_to_job == CinderJob.objects.get(job_id='5678')
+
+        # is cleared
+        assert not NeedsHumanReview.objects.filter(
+            reason=NeedsHumanReview.REASONS.ABUSE_ADDON_VIOLATION, is_active=True
+        ).exists()
+
+    def _test_single_action_remove_from_queue_history(
+        self, review_action, log_action, channel=amo.CHANNEL_LISTED
+    ):
+        self.setup_data(
+            amo.STATUS_APPROVED, channel=channel, file_status=amo.STATUS_AWAITING_REVIEW
+        )
+        self.review_version.needshumanreview_set.all().delete()
+        self.review_version.reviewqueuehistory_set.all().delete()
+        if 'multiple' in review_action:
+            self.helper.handler.data['versions'] = [self.review_version]
+        self.review_version.needshumanreview_set.create()
+        self.review_version.reload()
+        assert self.review_version.due_date
+        original_due_date = self.review_version.due_date
+        assert self.review_version.reviewqueuehistory_set.count() == 1
+        entry_one = self.review_version.reviewqueuehistory_set.get()
+        assert entry_one.original_due_date == original_due_date
+        assert not entry_one.exit_date
+        assert not entry_one.review_decision_log
+        # Manually create extra ReviewQueueHistory: It shouldn't matter, they
+        # should only gain an exit_date and review_decision_log if there wasn't
+        # one already.
+        entry_two = self.review_version.reviewqueuehistory_set.create(
+            original_due_date=original_due_date
+        )
+        old_exit_date = self.days_ago(2)
+        entry_already_exited = self.review_version.reviewqueuehistory_set.create(
+            original_due_date=original_due_date,
+            exit_date=old_exit_date,
+        )
+        some_old_activity = ActivityLog.objects.create(
+            amo.LOG.APPROVE_VERSION, self.review_version, user=self.user
+        )
+        entry_already_logged = self.review_version.reviewqueuehistory_set.create(
+            original_due_date=original_due_date, review_decision_log=some_old_activity
+        )
+
+        getattr(self.helper.handler, review_action)()
+        log_entry = (
+            ActivityLog.objects.exclude(id=some_old_activity.id)
+            .filter(action=log_action.id)
+            .first()
+        )
+
+        assert self.review_version.reviewqueuehistory_set.count() == 4
+        # First 2 entries gained an exit date and review decision log.
+        for entry in [entry_one, entry_two]:
+            entry.reload()
+            self.assertCloseToNow(entry.exit_date)
+            assert entry.original_due_date == original_due_date
+            assert entry.review_decision_log
+            assert entry.review_decision_log == log_entry
+        # The third one already had an exit date that didn't change.
+        entry_already_exited.reload()
+        assert entry_already_exited.exit_date == old_exit_date
+        assert entry_already_exited.original_due_date == original_due_date
+        assert entry_already_exited.review_decision_log == log_entry
+        # The fourth one gained an exit date but kept its review decision log.
+        entry_already_logged.reload()
+        self.assertCloseToNow(entry_already_logged.exit_date)
+        assert entry_already_logged.original_due_date == original_due_date
+        assert entry_already_logged.review_decision_log == some_old_activity
+
+    def test_actions_remove_from_queue_history(self):
+        # Pretend the version was auto-approved in the past, it will allow us
+        # to confirm auto-approval later.
+        AutoApprovalSummary.objects.create(
+            version=self.review_version, verdict=amo.AUTO_APPROVED
+        )
+        for review_action, activity in (
+            ('approve_latest_version', amo.LOG.APPROVE_VERSION),
+            ('reject_latest_version', amo.LOG.REJECT_VERSION),
+            ('confirm_auto_approved', amo.LOG.CONFIRM_AUTO_APPROVED),
+            ('reject_multiple_versions', amo.LOG.REJECT_VERSION),
+            ('disable_addon', amo.LOG.FORCE_DISABLE),
+            (
+                'clear_needs_human_review_multiple_versions',
+                amo.LOG.CLEAR_NEEDS_HUMAN_REVIEW,
+            ),
         ):
-            for action_name, action in resolves_actions.items():
-                action['method']()
-                resolve_mock.assert_called_once()
-                resolve_mock.reset_mock()
-                assert (
-                    getattr(log_action_mock.call_args.args[0], 'hide_developer', False)
-                    != should_email[action_name]
-                )
-                log_action_mock.assert_called_once()
-                log_action_mock.reset_mock()
-                self.helper.handler.log_entry = None
+            self._test_single_action_remove_from_queue_history(review_action, activity)
 
-    def test_resolve_abuse_reports_called_everywhere_checkbox_shown_listed(self):
-        self._resolve_abuse_reports_called_everywhere_checkbox_shown(
-            amo.CHANNEL_LISTED,
-            [
-                ('public', True),
-                ('reject', True),
-                ('confirm_auto_approved', False),
-                ('reject_multiple_versions', True),
-                ('clear_needs_human_review_multiple_versions', False),
-                ('disable_addon', True),
-            ],
-        )
+        # Unlisted have actions with custom implementations, check those as
+        # well.
+        for review_action, activity in (
+            ('approve_latest_version', amo.LOG.APPROVE_VERSION),
+            ('confirm_auto_approved', amo.LOG.CONFIRM_AUTO_APPROVED),
+            ('approve_multiple_versions', amo.LOG.APPROVE_VERSION),
+        ):
+            self._test_single_action_remove_from_queue_history(
+                review_action, activity, channel=amo.CHANNEL_UNLISTED
+            )
 
-    def test_resolve_abuse_reports_called_everywhere_checkbox_shown_unlisted(self):
-        self._resolve_abuse_reports_called_everywhere_checkbox_shown(
-            amo.CHANNEL_UNLISTED,
-            [
-                ('public', True),
-                ('approve_multiple_versions', True),
-                ('reject_multiple_versions', True),
-                ('confirm_multiple_versions', False),
-                ('clear_needs_human_review_multiple_versions', False),
-                ('disable_addon', True),
-            ],
+    def test_non_human_approval_does_not_affect_queue_history(self):
+        self.setup_data(
+            amo.STATUS_APPROVED,
+            file_status=amo.STATUS_AWAITING_REVIEW,
+            human_review=False,
         )
+        self.review_version.needshumanreview_set.all().delete()
+        self.review_version.reviewqueuehistory_set.all().delete()
+        self.review_version.needshumanreview_set.create()
+        self.review_version.reload()
+        assert self.review_version.due_date
+        assert self.review_version.reviewqueuehistory_set.count() == 1
+        entry = self.review_version.reviewqueuehistory_set.get()
+        assert not entry.exit_date
+        assert not entry.review_decision_log
+
+        self.helper.handler.approve_latest_version()
+
+        # Since the review wasn't performed by a human, queue history should
+        # not have been affected and the NHR should still be there
+        assert self.review_version.needshumanreview_set.filter(is_active=True).count()
+        entry.reload()
+        assert not entry.exit_date
+        assert not entry.review_decision_log
+
+    def test_remove_from_queue_history_multiple_versions_cleared(self):
+        v2 = version_factory(
+            addon=self.addon, version='3.0', file_kw={'is_signed': True}
+        )
+        v3 = version_factory(
+            addon=self.addon, version='4.0', file_kw={'is_signed': True}
+        )
+        self.review_version.file.update(is_signed=True)
+        versions = [v3, v2, self.review_version]
+        for v in versions:
+            v.needshumanreview_set.create()
+            v.reload()
+            assert v.due_date
+            assert v.reviewqueuehistory_set.count() == 1
+            entry = v.reviewqueuehistory_set.get()
+            assert entry.original_due_date == v.due_date
+            assert not entry.exit_date
+            assert not entry.review_decision_log
+        self.setup_data(amo.STATUS_APPROVED, file_status=amo.STATUS_APPROVED)
+        self.helper.handler.data['versions'] = versions
+        self.helper.handler.reject_multiple_versions()
+        for v in versions:
+            v.reload()
+            assert not v.due_date
+            assert v.reviewqueuehistory_set.count() == 1
+            entry = v.reviewqueuehistory_set.get()
+            assert entry.original_due_date
+            self.assertCloseToNow(entry.exit_date)
+            assert entry.review_decision_log
 
 
 @override_settings(ENABLE_ADDON_SIGNING=True)
@@ -3306,7 +4238,7 @@ class TestReviewHelperSigning(TestReviewHelperBase):
     def test_nominated_to_public_recommended(self):
         self.setup_data(amo.STATUS_NOMINATED)
 
-        self.make_addon_promoted(self.addon, RECOMMENDED)
+        self.make_addon_promoted(self.addon, PROMOTED_GROUP_CHOICES.RECOMMENDED)
         assert not self.addon.promoted_group()
 
         self.helper.handler.approve_latest_version()
@@ -3315,9 +4247,9 @@ class TestReviewHelperSigning(TestReviewHelperBase):
         assert self.addon.versions.all()[0].file.status == (amo.STATUS_APPROVED)
 
         assert self.addon.current_version.promoted_approvals.filter(
-            group_id=RECOMMENDED.id
+            group_id=PROMOTED_GROUP_CHOICES.RECOMMENDED
         ).exists()
-        assert self.addon.promoted_group() == RECOMMENDED
+        assert self.addon.promoted_group().id == PROMOTED_GROUP_CHOICES.RECOMMENDED
 
         signature_info, manifest = _get_signature_details(self.file.file.path)
 

@@ -20,8 +20,6 @@ EMAIL_HOST_PASSWORD = EMAIL_URL['EMAIL_HOST_PASSWORD']
 
 SEND_REAL_EMAIL = True
 
-ENV = env('ENV')
-
 API_THROTTLING = True
 
 DOMAIN = env('DOMAIN', default='addons.mozilla.org')
@@ -31,7 +29,6 @@ SITE_URL = 'https://' + DOMAIN
 INTERNAL_SITE_URL = env('INTERNAL_SITE_URL', default='https://addons.mozilla.org')
 EXTERNAL_SITE_URL = env('EXTERNAL_SITE_URL', default='https://addons.mozilla.org')
 SERVICES_URL = 'https://' + SERVICES_DOMAIN
-CODE_MANAGER_URL = env('CODE_MANAGER_URL', default='https://code.addons.mozilla.org')
 STATIC_URL = PROD_STATIC_URL
 MEDIA_URL = PROD_MEDIA_URL
 
@@ -73,7 +70,6 @@ REMOTE_SETTINGS_API_URL = 'https://firefox.settings.services.mozilla.com/v1/'
 REMOTE_SETTINGS_WRITER_URL = env(
     'REMOTE_SETTINGS_WRITER_URL', default='https://remote-settings.mozilla.org/v1/'
 )
-REMOTE_SETTINGS_WRITER_BUCKET = 'staging'
 
 # See: https://bugzilla.mozilla.org/show_bug.cgi?id=1633746
 BIGQUERY_AMO_DATASET = 'amo_prod'

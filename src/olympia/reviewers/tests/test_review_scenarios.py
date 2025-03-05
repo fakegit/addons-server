@@ -3,9 +3,15 @@
 For different add-on and file statuses, test reviewing them, and make sure then
 end up in the correct state.
 """
+
+import json
+import uuid
 from unittest import mock
 
+from django.conf import settings
+
 import pytest
+import responses
 
 from olympia import amo
 from olympia.amo.tests import addon_factory, user_factory
@@ -15,8 +21,7 @@ from olympia.reviewers.utils import ReviewAddon, ReviewFiles, ReviewHelper
 @mock.patch('olympia.reviewers.utils.sign_file', lambda f: None)
 @pytest.mark.django_db
 @pytest.mark.parametrize(
-    'review_action,addon_status,file_status,review_class,review_type,'
-    'final_addon_status,final_file_status',
+    'review_action,addon_status,file_status,review_class,final_addon_status,final_file_status',
     [
         # New addon request full.
         # scenario0: should succeed, files approved.
@@ -25,7 +30,6 @@ from olympia.reviewers.utils import ReviewAddon, ReviewFiles, ReviewHelper
             amo.STATUS_NOMINATED,
             amo.STATUS_AWAITING_REVIEW,
             ReviewAddon,
-            'extension_nominated',
             amo.STATUS_APPROVED,
             amo.STATUS_APPROVED,
         ),
@@ -35,7 +39,6 @@ from olympia.reviewers.utils import ReviewAddon, ReviewFiles, ReviewHelper
             amo.STATUS_NOMINATED,
             amo.STATUS_AWAITING_REVIEW,
             ReviewAddon,
-            'extension_nominated',
             amo.STATUS_NULL,
             amo.STATUS_DISABLED,
         ),
@@ -46,7 +49,6 @@ from olympia.reviewers.utils import ReviewAddon, ReviewFiles, ReviewHelper
             amo.STATUS_APPROVED,
             amo.STATUS_AWAITING_REVIEW,
             ReviewFiles,
-            'extension_pending',
             amo.STATUS_APPROVED,
             amo.STATUS_APPROVED,
         ),
@@ -56,7 +58,6 @@ from olympia.reviewers.utils import ReviewAddon, ReviewFiles, ReviewHelper
             amo.STATUS_APPROVED,
             amo.STATUS_AWAITING_REVIEW,
             ReviewFiles,
-            'extension_pending',
             amo.STATUS_NULL,
             amo.STATUS_DISABLED,
         ),
@@ -67,10 +68,14 @@ def test_review_scenario(
     addon_status,
     file_status,
     review_class,
-    review_type,
     final_addon_status,
     final_file_status,
 ):
+    responses.add_callback(
+        responses.POST,
+        f'{settings.CINDER_SERVER_URL}create_decision',
+        callback=lambda r: (201, {}, json.dumps({'uuid': uuid.uuid4().hex})),
+    )
     # Setup the addon and files.
     addon = addon_factory(
         name='My Addon',
@@ -82,7 +87,6 @@ def test_review_scenario(
     # Get the review helper.
     helper = ReviewHelper(addon=addon, version=version, user=user_factory())
     assert isinstance(helper.handler, review_class)
-    assert helper.handler.review_type == review_type
     helper.set_data({'comments': 'testing review scenarios'})
     # Run the action (approve_latest_version, reject_latest_version).
     try:

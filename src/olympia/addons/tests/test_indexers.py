@@ -10,7 +10,7 @@ from olympia.amo.tests import ESTestCase, TestCase, addon_factory
 from olympia.bandwagon.models import Collection
 from olympia.constants.applications import FIREFOX
 from olympia.constants.licenses import LICENSES_BY_BUILTIN
-from olympia.constants.promoted import RECOMMENDED
+from olympia.constants.promoted import PROMOTED_GROUP_CHOICES
 from olympia.constants.search import SEARCH_LANGUAGE_TO_ANALYZER
 from olympia.files.models import WebextPermission
 from olympia.versions.compare import version_int
@@ -342,12 +342,12 @@ class TestAddonIndexer(TestCase):
     def test_extract_translations(self):
         translations_name = {
             'en-US': 'Name in ënglish',
-            'es': 'Name in Español',
+            'es-ES': 'Name in Español',
             'it': None,  # Empty name should be ignored in extract.
         }
         translations_description = {
             'en-US': 'Description in ënglish',
-            'es': 'Description in Español',
+            'es-ES': 'Description in Español',
             'fr': '',  # Empty description should be ignored in extract.
             'it': '<script>alert(42)</script>',
         }
@@ -358,19 +358,19 @@ class TestAddonIndexer(TestCase):
         extracted = self._extract()
         assert extracted['name_translations'] == [
             {'lang': 'en-US', 'string': translations_name['en-US']},
-            {'lang': 'es', 'string': translations_name['es']},
+            {'lang': 'es-ES', 'string': translations_name['es-ES']},
         ]
         assert extracted['description_translations'] == [
             {'lang': 'en-US', 'string': translations_description['en-US']},
-            {'lang': 'es', 'string': translations_description['es']},
+            {'lang': 'es-ES', 'string': translations_description['es-ES']},
             {'lang': 'it', 'string': '&lt;script&gt;alert(42)&lt;/script&gt;'},
         ]
         assert extracted['name_l10n_en-us'] == translations_name['en-US']
         assert extracted['name_l10n_en-gb'] == ''
-        assert extracted['name_l10n_es'] == translations_name['es']
+        assert extracted['name_l10n_es-es'] == translations_name['es-ES']
         assert extracted['name_l10n_it'] == ''
         assert extracted['description_l10n_en-us'] == translations_description['en-US']
-        assert extracted['description_l10n_es'] == translations_description['es']
+        assert extracted['description_l10n_es-es'] == translations_description['es-ES']
         assert extracted['description_l10n_fr'] == ''
         assert (
             extracted['description_l10n_it'] == '&lt;script&gt;alert(42)&lt;/script&gt;'
@@ -394,29 +394,31 @@ class TestAddonIndexer(TestCase):
             }
 
             self.addon = Addon.objects.create(**kwargs)
-            self.addon.name = {'es': 'Banana Bonkers espanole'}
-            self.addon.description = {'es': 'Deje que su navegador coma sus plátanos'}
-            self.addon.summary = {'es': 'resumen banana'}
+            self.addon.name = {'es-ES': 'Banana Bonkers espanole'}
+            self.addon.description = {
+                'es-ES': 'Deje que su navegador coma sus plátanos'
+            }
+            self.addon.summary = {'es-ES': 'resumen banana'}
             self.addon.save()
 
         extracted = self._extract()
 
         assert extracted['name_translations'] == [
             {'lang': 'en-GB', 'string': 'Banana Bonkers'},
-            {'lang': 'es', 'string': 'Banana Bonkers espanole'},
+            {'lang': 'es-ES', 'string': 'Banana Bonkers espanole'},
         ]
         assert extracted['description_translations'] == [
             {'lang': 'en-GB', 'string': 'Let your browser eat your bananas'},
-            {'lang': 'es', 'string': 'Deje que su navegador coma sus plátanos'},
+            {'lang': 'es-ES', 'string': 'Deje que su navegador coma sus plátanos'},
         ]
         assert extracted['name_l10n_en-gb'] == 'Banana Bonkers'
         assert extracted['name_l10n_en-us'] == ''
-        assert extracted['name_l10n_es'] == 'Banana Bonkers espanole'
+        assert extracted['name_l10n_es-es'] == 'Banana Bonkers espanole'
         assert (
             extracted['description_l10n_en-gb'] == 'Let your browser eat your bananas'
         )
         assert (
-            extracted['description_l10n_es']
+            extracted['description_l10n_es-es']
             == 'Deje que su navegador coma sus plátanos'
         )
 
@@ -510,10 +512,10 @@ class TestAddonIndexer(TestCase):
         assert extracted['is_recommended'] is False
 
         # Promoted extension.
-        self.addon = addon_factory(promoted=RECOMMENDED)
+        self.addon = addon_factory(promoted_id=PROMOTED_GROUP_CHOICES.RECOMMENDED)
         extracted = self._extract()
         assert extracted['promoted']
-        assert extracted['promoted']['group_id'] == RECOMMENDED.id
+        assert extracted['promoted']['group_id'] == PROMOTED_GROUP_CHOICES.RECOMMENDED
         assert extracted['promoted']['approved_for_apps'] == [
             amo.FIREFOX.id,
             amo.ANDROID.id,
@@ -534,7 +536,7 @@ class TestAddonIndexer(TestCase):
         featured_collection.add_addon(self.addon)
         extracted = self._extract()
         assert extracted['promoted']
-        assert extracted['promoted']['group_id'] == RECOMMENDED.id
+        assert extracted['promoted']['group_id'] == PROMOTED_GROUP_CHOICES.RECOMMENDED
         assert extracted['promoted']['approved_for_apps'] == [
             amo.FIREFOX.id,
             amo.ANDROID.id,

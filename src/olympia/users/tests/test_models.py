@@ -762,12 +762,12 @@ class TestUserProfile(TestCase):
         review_list = [rating.pk for rating in user.ratings]
 
         assert len(review_list) == 1
-        assert (
-            new_rating.pk in review_list
-        ), 'Original review must show up in ratings list.'
-        assert (
-            new_reply.pk not in review_list
-        ), 'Developer reply must not show up in ratings list.'
+        assert new_rating.pk in review_list, (
+            'Original review must show up in ratings list.'
+        )
+        assert new_reply.pk not in review_list, (
+            'Developer reply must not show up in ratings list.'
+        )
 
     def test_num_addons_listed(self):
         """Test that num_addons_listed is only considering add-ons for which
@@ -921,6 +921,18 @@ class TestDeniedName(TestCase):
         assert DeniedName.blocked('IE6fantastic')
         assert not DeniedName.blocked('IE6')
         assert not DeniedName.blocked('testo')
+
+    def test_blocked_emoji(self):
+        assert not DeniedName.blocked('Test 🎧')
+        assert not DeniedName.blocked('Test 🌠')
+
+        denied = DeniedName.objects.create(name='🌠')
+        assert not DeniedName.blocked('Test 🎧')
+        assert DeniedName.blocked('Test 🌠')
+
+        denied.update(name='🎧')
+        assert DeniedName.blocked('Test 🎧')
+        assert not DeniedName.blocked('Test 🌠')
 
 
 class TestIPNetworkUserRestriction(TestCase):
@@ -1568,5 +1580,5 @@ class TestSuppressedEmailVerification(TestCase):
         )
         assert not email_verification.is_timedout
 
-        with freeze_time(email_verification.created + timedelta(seconds=31)):
+        with freeze_time(email_verification.created + timedelta(minutes=10, seconds=1)):
             assert email_verification.is_timedout
